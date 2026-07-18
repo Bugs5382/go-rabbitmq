@@ -1,0 +1,14 @@
+version: "2"
+
+linters:
+  default: standard
+  enable:
+    - gosec
+  exclusions:
+    rules:
+      # Backoff jitter uses math/rand deliberately: it randomizes reconnect
+      # timing to avoid a thundering herd, and has no security requirement.
+      - linters:
+          - gosec
+        text: "G404"
+        path: backoff.go

@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 📚 Documentation
+    url: https://github.com/Bugs5382/go-rabbitmq#readme
+    about: The README, per-package READMEs, and pages/ cover most "how do I..." questions.
+  - name: 🐇 RabbitMQ Documentation
+    url: https://www.rabbitmq.com/documentation.html
+    about: Canonical reference for exchanges, queues, bindings, and quorum vs classic queues. Worth a look before a topology bug.
+  - name: 💬 Discussions
+    url: https://github.com/Bugs5382/go-rabbitmq/discussions
+    about: General questions, deployment notes, or design ideas that aren't actionable reports.
