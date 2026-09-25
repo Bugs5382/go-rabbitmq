@@ -55,6 +55,19 @@ var (
 	// ErrConfirmTimeout.
 	ErrConfirmLost = errors.New("rabbitmq: channel closed before the publish was confirmed")
 
+	// ErrRequeue, returned (or wrapped) by a Handler, negatively acknowledges the
+	// message with requeue=true, whatever ConsumerConfig.RequeueOnError says. Use
+	// it for a transient failure the message should be retried for, for example
+	// fmt.Errorf("store unavailable: %w", rabbitmq.ErrRequeue).
+	ErrRequeue = errors.New("rabbitmq: requeue message")
+
+	// ErrDeadLetter, returned (or wrapped) by a Handler, rejects the message
+	// without requeue, whatever ConsumerConfig.RequeueOnError says. The broker
+	// dead-letters it to the queue's x-dead-letter-exchange if one is set and
+	// drops it otherwise. Use it for a poison message that will never succeed.
+	// If an error matches both ErrDeadLetter and ErrRequeue, ErrDeadLetter wins.
+	ErrDeadLetter = errors.New("rabbitmq: dead-letter message")
+
 	// ErrInvalidQueue is returned when a QueueConfig violates a broker rule, most
 	// commonly a quorum queue that is also exclusive, auto-delete or server-named.
 	ErrInvalidQueue = errors.New("rabbitmq: invalid queue configuration")

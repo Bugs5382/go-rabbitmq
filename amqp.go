@@ -56,6 +56,7 @@ type wireChannel interface {
 	Qos(prefetchCount, prefetchSize int, global bool) error
 	Ack(tag uint64, multiple bool) error
 	Nack(tag uint64, multiple, requeue bool) error
+	Reject(tag uint64, requeue bool) error
 	NotifyClose(receiver chan *amqp.Error) chan *amqp.Error
 	Close() error
 	IsClosed() bool

@@ -52,15 +52,35 @@ A nack or a confirm timeout (`WithConfirmTimeout`, default 30s) is returned stra
 
 ## 📥 Consume
 
-A consumer re-declares its topology and resumes after any reconnect. Your handler's returned error drives the ack (requeue configurable), so it survives broker restarts.
+A consumer re-declares its topology and resumes after any reconnect, so it survives broker restarts. Your handler's returned error decides how each message is settled:
+
+| Handler returns | Settlement |
+|---|---|
+| `nil` | ack |
+| an error matching `rabbitmq.ErrRequeue` | nack with requeue |
+| an error matching `rabbitmq.ErrDeadLetter` | reject without requeue: dead-lettered via the queue's `x-dead-letter-exchange`, or dropped if it has none |
+| any other error (or a panic) | nack; requeued unless the config is `NoRequeue()` |
+
+Wrap the sentinels to keep the cause (`fmt.Errorf("decode: %w", rabbitmq.ErrDeadLetter)`); if an error matches both, dead-letter wins. If the channel drops while the handler runs, the message is not settled at all, because its delivery tag died with the channel. The broker redelivers it after the reconnect.
 
 ```go
 conn.Consume(ctx, rabbitmq.ConsumerConfig{
-	Queue:    rabbitmq.QueueConfig{Name: "orders", Type: rabbitmq.QueueQuorum},
-	Exchange: "events",
-	Bindings: []string{"order.*"},
+	Exchange: rabbitmq.ExchangeConfig{Name: "events"},
+	Queue: rabbitmq.QueueConfig{
+		Name: "orders",
+		Type: rabbitmq.QueueQuorum,
+		Args: amqp.Table{"x-dead-letter-exchange": "events.dlx"},
+	},
+	Bindings: []rabbitmq.BindingConfig{{Exchange: "events", RoutingKey: "order.*"}},
 }, func(ctx context.Context, d rabbitmq.Delivery) error {
-	return handle(d.Body)
+	order, err := decode(d.Body)
+	if err != nil {
+		return fmt.Errorf("decode: %w", rabbitmq.ErrDeadLetter) // poison: never retry
+	}
+	if err := store(ctx, order); errors.Is(err, errUnavailable) {
+		return fmt.Errorf("store: %w", rabbitmq.ErrRequeue) // transient: try again
+	}
+	return err // nil acks
 })
 ```
 
