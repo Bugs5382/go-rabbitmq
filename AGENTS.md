@@ -14,7 +14,7 @@ go get github.com/Bugs5382/go-rabbitmq
 
 | Import path | What you use it for | Key exports |
 |---|---|---|
-| `github.com/Bugs5382/go-rabbitmq` | Everything: connect, publish, consume, declare topology. | `Connect`, `Conn`, `Option` (`WithBackoff`, `WithTLS`, `WithLogger`, `WithObserver`, `WithHeartbeat`, `WithVhost`, `WithClientProperties`, `WithPublishInterceptor`, `WithConsumeInterceptor`), `Backoff`, `DefaultBackoff`, `Publisher`, `PublishOption`, `PublisherOption` (`WithConfirms`, `WithConfirmTimeout`, ...), `Delivery`, `Handler`, `ConsumerConfig`, `ErrRequeue`/`ErrDeadLetter`, `ExchangeConfig`, `QueueConfig`, `BindingConfig`, `Topology`, `QueueType` (`QueueClassic`/`QueueQuorum`), `Logger`, `Observer`/`NopObserver`, `PublishInterceptor`/`ConsumeInterceptor`, sentinel errors. |
+| `github.com/Bugs5382/go-rabbitmq` | Everything: connect, publish, consume, declare topology. | `Connect`, `Conn`, `Option` (`WithBackoff`, `WithTLS`, `WithLogger`, `WithObserver`, `WithHeartbeat`, `WithVhost`, `WithClientProperties`, `WithPublishInterceptor`, `WithConsumeInterceptor`), `Backoff`, `DefaultBackoff`, `Publisher`, `PublishOption`, `PublisherOption` (`WithConfirms`, `WithConfirmTimeout`, ...), `Delivery`, `Handler`, `ConsumerConfig`, `Consumer` (`NewConsumer`, `Run`, `Ready`, `Status`), `ConsumerStatus`, `ConsumerState`, `ErrRequeue`/`ErrDeadLetter`, `ExchangeConfig`, `QueueConfig`, `BindingConfig`, `Topology`, `QueueType` (`QueueClassic`/`QueueQuorum`), `Logger`, `Observer`/`NopObserver`, `PublishInterceptor`/`ConsumeInterceptor`, sentinel errors. |
 | `github.com/Bugs5382/go-rabbitmq/otel` | OpenTelemetry tracing + metrics. | `Instrument(...) []rabbitmq.Option`, `PublishInterceptor`, `ConsumeInterceptor`, `WithTracerProvider`, `WithMeterProvider`, `WithPropagator`. |
 
 ---
@@ -27,7 +27,7 @@ go get github.com/Bugs5382/go-rabbitmq
 
 3. **`Publish` returns an error only after bounded retries.** It ensures a live channel, re-opens/re-declares on a drop, and retries within `Backoff`. Treat a returned error as *retryable*: keep the message (outbox) and try again later. By default it does **not** guarantee broker-side delivery — it guarantees the bytes left the client or you got an error. Add `WithConfirms()` when you need the broker's word: `Publish` then returns nil only on a broker ack (see [Publisher confirms](#publisher-confirms)).
 
-4. **`Consume` blocks; run it in a goroutine.** It re-declares its exchange/queue/bindings and resumes after every reconnect. It returns `ctx.Err()` when your `ctx` is cancelled, or `ErrClosed` if the `Conn` is closed. Deliveries are dispatched **sequentially**; for concurrency, fan out inside your handler (respect `Prefetch` for backpressure).
+4. **`Consume` blocks; run it in a goroutine.** It re-declares its exchange/queue/bindings and resumes after every reconnect. It returns `ctx.Err()` when your `ctx` is cancelled, or `ErrClosed` if the `Conn` is closed. Deliveries are dispatched **sequentially**; for concurrency, fan out inside your handler (respect `Prefetch` for backpressure). **Drive readiness from the consumer, not the connection:** `conn.Healthy()` stays true while a consumer retries a failing declare forever. Use `cons := conn.NewConsumer(cfg, h); go cons.Run(ctx)` and report `cons.Ready()` (see [Readiness](#readiness)).
 
 5. **Settlement is driven by your handler's error — don't ack yourself.** Return `nil` to ack. Return an error matching `ErrRequeue` to nack with requeue, or `ErrDeadLetter` to reject without requeue (dead-lettered if the queue has `x-dead-letter-exchange`). Any other error nacks, and `RequeueOnError` (default `true`) decides requeue vs drop. Wrapping works (`errors.Is`); `ErrDeadLetter` wins if both match. A handler panic is recovered and treated as a plain error. If the channel closed while the handler ran, nothing is settled and the broker redelivers. `Delivery` is a read-only value; there is no `d.Ack()`.
 
@@ -148,6 +148,34 @@ go func() {
 }()
 ```
 
+### Readiness
+
+`Consume` is shorthand for `NewConsumer(cfg, handler).Run(ctx)`. Build the `*Consumer` yourself when anything needs its state:
+
+```go
+cfg.OnStatus = func(st rabbitmq.ConsumerStatus) { // optional push; runs on the consumer goroutine, keep it quick
+	metrics.SetConsumerState(st.Queue, st.State.String())
+}
+cons := conn.NewConsumer(cfg, handle)
+go func() {
+	if err := cons.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		log.Printf("consumer stopped: %v", err)
+	}
+}()
+
+ready := cons.Ready()  // true only while ConsumerConsuming
+st := cons.Status()    // State, Queue, Err, Attempt, RetryIn, Since
+```
+
+| `st.State` | `Ready()` | `st.Err` |
+|---|---|---|
+| `ConsumerStarting` | false | nil |
+| `ConsumerConsuming` | true | nil |
+| `ConsumerRetrying` | false | the declare/bind/QoS/consume error, or the drop; `Attempt` counts consecutive failures, `RetryIn` is the next backoff |
+| `ConsumerStopped` | false | what `Run` returned (`ctx.Err()`, `ErrClosed`) |
+
+Retries never stop on their own; the delay grows per consecutive failure (`Backoff.Initial` × `Factor`^(attempt-1), capped at `Max`) and resets after a successful session. Each retry logs a warning with the queue, error, attempt and delay. A second concurrent `Run` on the same `Consumer` returns `ErrConsumerRunning`; `Run` again after it returns is fine.
+
 `Delivery` fields: `Body`, `RoutingKey`, `Exchange`, `ContentType`, `Headers`, `DeliveryTag`, `Redelivered`, `MessageID`, `CorrelationID`, `ReplyTo`, `Type`, `AppID`, `Priority`, `Timestamp`.
 
 ### Per-message settlement
@@ -233,6 +261,7 @@ errors.Is(err, rabbitmq.ErrPublishFailed) // publish failed (retryable); every e
 errors.Is(err, rabbitmq.ErrNacked)        // confirms: broker nacked
 errors.Is(err, rabbitmq.ErrConfirmTimeout) // confirms: no answer in time (outcome unknown)
 errors.Is(err, rabbitmq.ErrConfirmLost)   // confirms: channel dropped, retries spent (outcome unknown)
+errors.Is(err, rabbitmq.ErrConsumerRunning) // Consumer.Run called while that Consumer already runs
 errors.Is(err, rabbitmq.ErrInvalidQueue)  // bad queue shape (e.g. exclusive quorum queue, or a transient non-exclusive queue on RabbitMQ 4)
 
 // returned by a Handler to pick the settlement of one message

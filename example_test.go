@@ -27,6 +27,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"net/http"
 	"time"
 
 	rabbitmq "github.com/Bugs5382/go-rabbitmq"
@@ -84,6 +85,37 @@ func ExampleConn_Consume() {
 	}()
 
 	time.Sleep(time.Second)
+}
+
+// ExampleConn_NewConsumer drives a readiness probe from the consumer itself, so
+// a queue declare that keeps failing reads as not ready even though the
+// connection is healthy.
+func ExampleConn_NewConsumer() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	conn, err := rabbitmq.Connect(ctx, "amqp://guest:guest@localhost:5672/")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	cons := conn.NewConsumer(rabbitmq.ConsumerConfig{
+		Queue: rabbitmq.QueueConfig{Name: "orders", Type: rabbitmq.QueueQuorum},
+		OnStatus: func(st rabbitmq.ConsumerStatus) {
+			if st.State == rabbitmq.ConsumerRetrying {
+				log.Printf("consumer on %s retrying (attempt %d, next in %s): %v", st.Queue, st.Attempt, st.RetryIn, st.Err)
+			}
+		},
+	}, func(_ context.Context, _ rabbitmq.Delivery) error { return nil })
+	go func() { _ = cons.Run(ctx) }()
+
+	http.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
+		if !cons.Ready() {
+			http.Error(w, cons.Status().State.String(), http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
 }
 
 // ExampleConn_DeclareTopology declares an exchange, a durable quorum queue and a

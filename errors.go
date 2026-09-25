@@ -74,4 +74,8 @@ var (
 	// broker refuses a transient queue that is not exclusive; that error wraps
 	// the broker's *amqp.Error as well, and its message names the fix.
 	ErrInvalidQueue = errors.New("rabbitmq: invalid queue configuration")
+
+	// ErrConsumerRunning is returned by Consumer.Run when the same Consumer is
+	// already running. A Consumer can be run again once Run has returned.
+	ErrConsumerRunning = errors.New("rabbitmq: consumer is already running")
 )

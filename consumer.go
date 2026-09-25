@@ -116,6 +116,12 @@ type ConsumerConfig struct {
 	Exclusive bool
 	// Args are passed to the underlying Consume call.
 	Args amqp.Table
+	// OnStatus, if set, is called with each new ConsumerStatus: starting,
+	// consuming, every retry (with the error, attempt and backoff), and stopped.
+	// It runs on the consumer's goroutine, so it must return quickly and must not
+	// call Run. Consumer.Status and Consumer.Ready give the same information on
+	// demand.
+	OnStatus func(ConsumerStatus)
 
 	// requeueSet distinguishes an explicit RequeueOnError:false from the zero
 	// value so the requeue default can be applied.
@@ -143,46 +149,26 @@ func (c ConsumerConfig) normalize() ConsumerConfig {
 
 // Consume runs a resilient consumer until ctx is cancelled. It (re-)declares the
 // configured topology, sets QoS, and consumes, dispatching each delivery to
-// handler. On any channel or connection drop it waits for the Conn to recover,
-// then re-declares and resumes. It returns ctx.Err() when ctx is cancelled, or
-// ErrClosed if the Conn is closed.
+// handler. On any channel or connection drop, or a failed declare or bind, it
+// backs off (escalating with consecutive failures), waits for the Conn to
+// recover, then re-declares and resumes. It returns ctx.Err() when ctx is
+// cancelled, or ErrClosed if the Conn is closed.
 //
 // Consume blocks; run it in its own goroutine. Deliveries are dispatched
 // sequentially on the calling goroutine, so a handler that must run concurrently
 // should fan out internally (respecting Prefetch for backpressure).
+//
+// Consume is shorthand for c.NewConsumer(cfg, handler).Run(ctx). Use NewConsumer
+// directly to read the consumer's readiness while it runs.
 func (c *Conn) Consume(ctx context.Context, cfg ConsumerConfig, handler Handler) error {
-	cfg = cfg.normalize()
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		err := c.consumeSession(ctx, cfg, handler)
-		switch {
-		case err == nil:
-			// session ended for a retryable reason (drop); loop and re-establish.
-		case ctx.Err() != nil:
-			return ctx.Err()
-		case c.isClosed():
-			return ErrClosed
-		default:
-			c.log.Warnf("rabbitmq: consumer session on %q ended: %v; re-establishing", cfg.Queue.Name, err)
-		}
-		// Small pause so a persistently failing session does not hot-loop; the
-		// first backoff step is short.
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-c.ctx.Done():
-			return ErrClosed
-		case <-time.After(c.opts.backoff.delay(0)):
-		}
-	}
+	return c.NewConsumer(cfg, handler).Run(ctx)
 }
 
 // consumeSession runs one channel's lifetime: declare, consume, dispatch until
 // the channel or connection drops (returns nil for a clean drop) or a setup step
-// fails (returns the error).
-func (c *Conn) consumeSession(ctx context.Context, cfg ConsumerConfig, handler Handler) error {
+// fails (returns the error). onConsuming is called with the resolved queue name
+// once the broker has accepted the consume, before the first delivery.
+func (c *Conn) consumeSession(ctx context.Context, cfg ConsumerConfig, handler Handler, onConsuming func(queue string)) error {
 	ch, err := c.openChannel(ctx)
 	if err != nil {
 		return err
@@ -204,6 +190,7 @@ func (c *Conn) consumeSession(ctx context.Context, cfg ConsumerConfig, handler H
 	}
 	closeCh := ch.NotifyClose(make(chan *amqp.Error, 1))
 	c.log.Infof("rabbitmq: consuming from %q (prefetch %d)", queueName, cfg.Prefetch)
+	onConsuming(queueName)
 
 	return c.dispatch(ctx, ch, cfg, queueName, handler, deliveries, closeCh)
 }

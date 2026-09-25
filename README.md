@@ -84,6 +84,32 @@ conn.Consume(ctx, rabbitmq.ConsumerConfig{
 })
 ```
 
+### Readiness
+
+`Conn.Healthy()` only says the connection is up. A consumer whose queue declare keeps failing retries on a healthy connection and consumes nothing, so drive readiness from the consumer. `NewConsumer` returns a `*Consumer` you run yourself; `Consume` is shorthand for `NewConsumer(cfg, handler).Run(ctx)`.
+
+```go
+cons := conn.NewConsumer(cfg, handle)
+go func() { _ = cons.Run(ctx) }()
+
+http.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
+	if !cons.Ready() {
+		st := cons.Status() // State, Queue, Err, Attempt, RetryIn, Since
+		http.Error(w, fmt.Sprintf("%s: %v", st.State, st.Err), http.StatusServiceUnavailable)
+		return
+	}
+})
+```
+
+| State | Ready | Meaning |
+|---|---|---|
+| `ConsumerStarting` | no | not run yet, or setting up its first session |
+| `ConsumerConsuming` | yes | topology declared, the broker is delivering |
+| `ConsumerRetrying` | no | a declare, bind, QoS or consume step failed, or the channel or connection dropped; `Err` is the last error |
+| `ConsumerStopped` | no | `Run` returned; `Err` is why |
+
+Retries back off with the connection's `Backoff`, growing with each consecutive failure up to `Max`, and each one is logged with the queue, the error, the attempt and the delay. Set `ConsumerConfig.OnStatus` to be told about every change instead of polling. It runs on the consumer's goroutine, so keep it quick.
+
 Ephemeral (server-named / exclusive / auto-delete) queues are declared with `x-queue-type: classic`, so a broker with `default_queue_type = quorum` can't turn them into quorum queues and fail the declare with `PRECONDITION_FAILED`. A quorum queue can't have any of those shapes, and the guard rejects that combination before it reaches the broker. A durable, named classic queue is declared without `x-queue-type` and follows the broker default; set `Args: amqp.Table{"x-queue-type": "classic"}` to pin it.
 
 RabbitMQ 4 refuses a transient queue that is not exclusive (the deprecated `transient_nonexcl_queues` feature) unless the broker operator permits it again. On RabbitMQ 4, use `.Transient()` only with `Exclusive: true`, or keep the queue durable and let `AutoDelete` or an `x-expires` TTL clean it up:
