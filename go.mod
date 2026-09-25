@@ -3,7 +3,7 @@ module github.com/Bugs5382/go-rabbitmq
 go 1.26
 
 require (
-	github.com/rabbitmq/amqp091-go v1.12.0
+	github.com/rabbitmq/amqp091-go v1.13.0
 	go.opentelemetry.io/otel v1.44.0
 	go.opentelemetry.io/otel/metric v1.44.0
 	go.opentelemetry.io/otel/sdk v1.44.0

@@ -84,7 +84,7 @@ conn.Consume(ctx, rabbitmq.ConsumerConfig{
 })
 ```
 
-Ephemeral (server-named / exclusive / auto-delete) queues are forced to classic — quorum queues can't be any of those, and the guard saves you the `PRECONDITION_FAILED`.
+Ephemeral (server-named / exclusive / auto-delete) queues are declared with `x-queue-type: classic`, so a broker with `default_queue_type = quorum` can't turn them into quorum queues and fail the declare with `PRECONDITION_FAILED`. A quorum queue can't have any of those shapes, and the guard rejects that combination before it reaches the broker. A durable, named classic queue is declared without `x-queue-type` and follows the broker default; set `Args: amqp.Table{"x-queue-type": "classic"}` to pin it.
 
 ## 📊 OpenTelemetry
 

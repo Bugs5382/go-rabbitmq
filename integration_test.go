@@ -106,3 +106,31 @@ func TestIntegrationRoundTrip(t *testing.T) {
 	cancel()
 	wg.Wait()
 }
+
+// TestIntegrationServerNamedClassicQueue declares the ephemeral fan-out shape
+// (server-named, exclusive, auto-delete). On a broker whose default_queue_type
+// is quorum this failed with PRECONDITION_FAILED before issue #3; it must pass
+// on any broker.
+func TestIntegrationServerNamedClassicQueue(t *testing.T) {
+	url := brokerURL(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	conn, err := rabbitmq.Connect(ctx, url)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	q, err := conn.DeclareQueue(ctx, rabbitmq.QueueConfig{
+		Type:       rabbitmq.QueueClassic,
+		AutoDelete: true,
+		Exclusive:  true,
+	}.Transient())
+	if err != nil {
+		t.Fatalf("declare server-named classic queue: %v", err)
+	}
+	if q.Name == "" {
+		t.Error("expected a server-assigned queue name")
+	}
+}
