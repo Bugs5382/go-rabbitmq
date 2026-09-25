@@ -86,6 +86,17 @@ conn.Consume(ctx, rabbitmq.ConsumerConfig{
 
 Ephemeral (server-named / exclusive / auto-delete) queues are declared with `x-queue-type: classic`, so a broker with `default_queue_type = quorum` can't turn them into quorum queues and fail the declare with `PRECONDITION_FAILED`. A quorum queue can't have any of those shapes, and the guard rejects that combination before it reaches the broker. A durable, named classic queue is declared without `x-queue-type` and follows the broker default; set `Args: amqp.Table{"x-queue-type": "classic"}` to pin it.
 
+RabbitMQ 4 refuses a transient queue that is not exclusive (the deprecated `transient_nonexcl_queues` feature) unless the broker operator permits it again. On RabbitMQ 4, use `.Transient()` only with `Exclusive: true`, or keep the queue durable and let `AutoDelete` or an `x-expires` TTL clean it up:
+
+```go
+// exclusive and transient: fine on every broker
+rabbitmq.QueueConfig{Exclusive: true, AutoDelete: true}.Transient()
+// durable, removed when the last consumer leaves: fine on every broker
+rabbitmq.QueueConfig{Name: "jobs.scratch", AutoDelete: true}
+```
+
+The library still sends a transient non-exclusive queue as asked, since RabbitMQ 3 accepts it. When a broker refuses it, the declare returns `ErrInvalidQueue` (wrapping the broker's error) with the fix in the message.
+
 ## 📊 OpenTelemetry
 
 The optional `otel` subpackage propagates W3C trace context through message headers (producer → consumer spans across the broker) and records publish/consume metrics. The core stays telemetry-free; wire it with one call:

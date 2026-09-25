@@ -25,7 +25,9 @@ OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 )
@@ -187,6 +189,13 @@ func (e ExchangeConfig) Transient() ExchangeConfig {
 }
 
 // Transient returns a copy of the queue config marked non-durable.
+//
+// RabbitMQ 4 refuses a transient queue that is not exclusive unless the broker
+// operator re-enables the deprecated transient_nonexcl_queues feature. On
+// RabbitMQ 4, use Transient only together with Exclusive, or keep the queue
+// durable and let AutoDelete or an x-expires TTL clean it up. The library still
+// sends the shape as asked, because RabbitMQ 3 accepts it; when a broker refuses
+// it, the declare returns ErrInvalidQueue with that fix in the message.
 func (q QueueConfig) Transient() QueueConfig {
 	q.Durable = false
 	q.durableSet = true
@@ -205,12 +214,47 @@ func declareExchangeOn(ch wireChannel, cfg ExchangeConfig) error {
 // declareQueueOn validates then declares a queue on an already-open channel,
 // returning the server's view of the queue (its name, message and consumer
 // counts).
-func declareQueueOn(ch wireChannel, cfg QueueConfig) (amqp.Queue, error) {
+func declareQueueOn(ch wireChannel, cfg QueueConfig, log Logger) (amqp.Queue, error) {
 	cfg = cfg.normalize()
 	if err := cfg.validate(); err != nil {
+		log.Warnf("rabbitmq: queue %q rejected before declare: %v", cfg.Name, err)
 		return amqp.Queue{}, err
 	}
-	return ch.QueueDeclare(cfg.Name, cfg.Durable, cfg.AutoDelete, cfg.Exclusive, cfg.NoWait, cfg.args())
+	log.Debugf("rabbitmq: declaring queue %q (type %s, durable %t, auto-delete %t, exclusive %t)",
+		cfg.Name, cfg.Type, cfg.Durable, cfg.AutoDelete, cfg.Exclusive)
+	if cfg.transientNonExclusive() {
+		log.Debugf("rabbitmq: queue %q is transient and not exclusive; RabbitMQ 4 refuses this shape "+
+			"unless the transient_nonexcl_queues feature is permitted", cfg.Name)
+	}
+	q, err := ch.QueueDeclare(cfg.Name, cfg.Durable, cfg.AutoDelete, cfg.Exclusive, cfg.NoWait, cfg.args())
+	if err != nil {
+		if isTransientQueueRefusal(err) {
+			err = fmt.Errorf("%w: queue %q is transient and not exclusive, which RabbitMQ 4 refuses by default "+
+				"(transient_nonexcl_queues); set Exclusive, or drop Transient() and keep the queue durable "+
+				"with AutoDelete or an x-expires TTL for cleanup: %w", ErrInvalidQueue, cfg.Name, err)
+		}
+		log.Warnf("rabbitmq: declare queue %q failed: %v", cfg.Name, err)
+		return amqp.Queue{}, err
+	}
+	log.Debugf("rabbitmq: declared queue %q (%d messages, %d consumers)", q.Name, q.Messages, q.Consumers)
+	return q, nil
+}
+
+// transientNonExclusive reports whether a normalized config is the shape that
+// RabbitMQ 4 refuses by default: a non-durable queue that is not exclusive
+// (issue #12). Durable queues and exclusive transient queues are unaffected.
+func (q QueueConfig) transientNonExclusive() bool {
+	return !q.Durable && !q.Exclusive
+}
+
+// isTransientQueueRefusal reports whether err is the broker refusing a
+// transient non-exclusive queue because the deprecated transient_nonexcl_queues
+// feature is not permitted. The broker is the authority here: the library does
+// not reject the shape itself, because RabbitMQ 3 and a RabbitMQ 4 broker that
+// re-enabled the feature both accept it (issue #12).
+func isTransientQueueRefusal(err error) bool {
+	var amqpErr *amqp.Error
+	return errors.As(err, &amqpErr) && strings.Contains(amqpErr.Reason, "transient_nonexcl_queues")
 }
 
 // DeclareExchange idempotently declares an exchange. Repeated calls with matching
@@ -232,7 +276,7 @@ func (c *Conn) DeclareQueue(ctx context.Context, cfg QueueConfig) (amqp.Queue, e
 		return amqp.Queue{}, err
 	}
 	defer func() { _ = ch.Close() }()
-	return declareQueueOn(ch, cfg)
+	return declareQueueOn(ch, cfg, c.log)
 }
 
 // BindQueue binds a queue to an exchange with a routing key.
@@ -263,19 +307,19 @@ func (c *Conn) DeclareTopology(ctx context.Context, t Topology) error {
 		return err
 	}
 	defer func() { _ = ch.Close() }()
-	return declareTopologyOn(ch, t)
+	return declareTopologyOn(ch, c.log, t)
 }
 
 // declareTopologyOn declares a whole topology on an already-open channel. It is
 // reused by the consumer when re-establishing its topology after a reconnect.
-func declareTopologyOn(ch wireChannel, t Topology) error {
+func declareTopologyOn(ch wireChannel, log Logger, t Topology) error {
 	for _, e := range t.Exchanges {
 		if err := declareExchangeOn(ch, e); err != nil {
 			return fmt.Errorf("declare exchange %q: %w", e.Name, err)
 		}
 	}
 	for _, q := range t.Queues {
-		if _, err := declareQueueOn(ch, q); err != nil {
+		if _, err := declareQueueOn(ch, q, log); err != nil {
 			return fmt.Errorf("declare queue %q: %w", q.Name, err)
 		}
 	}

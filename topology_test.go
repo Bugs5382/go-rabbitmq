@@ -122,7 +122,7 @@ func TestExchangeNormalizeDefaultsToDurableTopic(t *testing.T) {
 func TestDeclareTopologyOnRecordsAllInOrder(t *testing.T) {
 	t.Parallel()
 	ch := newFakeChannel()
-	err := declareTopologyOn(ch, Topology{
+	err := declareTopologyOn(ch, nopLogger{}, Topology{
 		Exchanges: []ExchangeConfig{{Name: "events"}},
 		Queues:    []QueueConfig{{Name: "orders"}},
 		Bindings:  []BindingConfig{{Queue: "orders", Exchange: "events", RoutingKey: "orders.*"}},
@@ -144,7 +144,7 @@ func TestDeclareTopologyOnRecordsAllInOrder(t *testing.T) {
 func TestDeclareTopologyOnPropagatesInvalidQueue(t *testing.T) {
 	t.Parallel()
 	ch := newFakeChannel()
-	err := declareTopologyOn(ch, Topology{
+	err := declareTopologyOn(ch, nopLogger{}, Topology{
 		Queues: []QueueConfig{{Name: "", Type: QueueQuorum}},
 	})
 	if !errors.Is(err, ErrInvalidQueue) {
@@ -212,7 +212,7 @@ func TestDeclareServerNamedQueueSendsClassicType(t *testing.T) {
 	t.Parallel()
 	ch := newFakeChannel()
 	cfg := QueueConfig{Name: "", Type: QueueClassic, AutoDelete: true, Exclusive: true}.Transient()
-	if _, err := declareQueueOn(ch, cfg); err != nil {
+	if _, err := declareQueueOn(ch, cfg, nopLogger{}); err != nil {
 		t.Fatalf("declareQueueOn: %v", err)
 	}
 	q := ch.declaredQueues()
