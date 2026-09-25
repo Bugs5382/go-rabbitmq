@@ -14,7 +14,7 @@ go get github.com/Bugs5382/go-rabbitmq
 
 | Import path | What you use it for | Key exports |
 |---|---|---|
-| `github.com/Bugs5382/go-rabbitmq` | Everything: connect, publish, consume, declare topology. | `Connect`, `Conn`, `Option` (`WithBackoff`, `WithTLS`, `WithLogger`, `WithObserver`, `WithHeartbeat`, `WithVhost`, `WithClientProperties`, `WithPublishInterceptor`, `WithConsumeInterceptor`), `Backoff`, `DefaultBackoff`, `Publisher`, `PublishOption`, `PublisherOption`, `Delivery`, `Handler`, `ConsumerConfig`, `ExchangeConfig`, `QueueConfig`, `BindingConfig`, `Topology`, `QueueType` (`QueueClassic`/`QueueQuorum`), `Logger`, `Observer`/`NopObserver`, `PublishInterceptor`/`ConsumeInterceptor`, sentinel errors. |
+| `github.com/Bugs5382/go-rabbitmq` | Everything: connect, publish, consume, declare topology. | `Connect`, `Conn`, `Option` (`WithBackoff`, `WithTLS`, `WithLogger`, `WithObserver`, `WithHeartbeat`, `WithVhost`, `WithClientProperties`, `WithPublishInterceptor`, `WithConsumeInterceptor`), `Backoff`, `DefaultBackoff`, `Publisher`, `PublishOption`, `PublisherOption` (`WithConfirms`, `WithConfirmTimeout`, ...), `Delivery`, `Handler`, `ConsumerConfig`, `ExchangeConfig`, `QueueConfig`, `BindingConfig`, `Topology`, `QueueType` (`QueueClassic`/`QueueQuorum`), `Logger`, `Observer`/`NopObserver`, `PublishInterceptor`/`ConsumeInterceptor`, sentinel errors. |
 | `github.com/Bugs5382/go-rabbitmq/otel` | OpenTelemetry tracing + metrics. | `Instrument(...) []rabbitmq.Option`, `PublishInterceptor`, `ConsumeInterceptor`, `WithTracerProvider`, `WithMeterProvider`, `WithPropagator`. |
 
 ---
@@ -25,7 +25,7 @@ go get github.com/Bugs5382/go-rabbitmq
 
 2. **`Connect`'s `ctx` governs only the *initial* dial.** It blocks re-dialling until the first success, honouring `ctx` (pass `context.WithTimeout` for fail-fast start-up) and `Backoff.MaxRetries`. After it returns, reconnection runs in the background for the life of the process (or until `MaxRetries`). The `ctx` you pass to `Publish`/`Consume` governs those calls, not the connection.
 
-3. **`Publish` returns an error only after bounded retries.** It ensures a live channel, re-opens/re-declares on a drop, and retries within `Backoff`. Treat a returned error as *retryable*: keep the message (outbox) and try again later. It does **not** guarantee broker-side delivery (no publisher confirms yet) — it guarantees the bytes left the client or you got an error.
+3. **`Publish` returns an error only after bounded retries.** It ensures a live channel, re-opens/re-declares on a drop, and retries within `Backoff`. Treat a returned error as *retryable*: keep the message (outbox) and try again later. By default it does **not** guarantee broker-side delivery — it guarantees the bytes left the client or you got an error. Add `WithConfirms()` when you need the broker's word: `Publish` then returns nil only on a broker ack (see [Publisher confirms](#publisher-confirms)).
 
 4. **`Consume` blocks; run it in a goroutine.** It re-declares its exchange/queue/bindings and resumes after every reconnect. It returns `ctx.Err()` when your `ctx` is cancelled, or `ErrClosed` if the `Conn` is closed. Deliveries are dispatched **sequentially**; for concurrency, fan out inside your handler (respect `Prefetch` for backpressure).
 
@@ -86,6 +86,38 @@ if errors.Is(err, rabbitmq.ErrPublishFailed) {
 ```
 
 Per-message `PublishOption`s: `WithContentType`, `WithHeaders`, `WithPersistent`, `WithMessageID`, `WithCorrelationID`, `WithReplyTo`, `WithExpiration`, `WithPriority`, `WithType`, `WithAppID`. An empty exchange name (`conn.NewPublisher("")`) targets the default exchange, where the routing key is the queue name.
+
+### Publisher confirms
+
+For at-least-once delivery (for example an outbox relay that marks a row sent only after the broker has it), turn on confirms. The channel is put in confirm mode on first use and again after every reconnect.
+
+```go
+pub := conn.NewPublisher("events",
+	rabbitmq.WithExchangeDeclare(rabbitmq.ExchangeConfig{Name: "events"}),
+	rabbitmq.WithConfirms(),
+	rabbitmq.WithConfirmTimeout(5*time.Second), // per attempt; default 30s
+)
+
+err := pub.Publish(ctx, "orders.created", body, rabbitmq.WithMessageID(row.ID))
+switch {
+case err == nil:
+	markSent(row) // broker acked
+case errors.Is(err, rabbitmq.ErrNacked):
+	// broker refused it; keep the row
+case errors.Is(err, rabbitmq.ErrConfirmTimeout), errors.Is(err, rabbitmq.ErrConfirmLost):
+	// outcome unknown; keep the row, a retry may duplicate
+}
+```
+
+| Broker answer | `Publish` returns | Retried inside `Publish`? |
+|---|---|---|
+| ack | `nil` | — |
+| nack | `ErrNacked` | no |
+| none within the confirm timeout | `ErrConfirmTimeout` | no |
+| channel/connection dropped before the answer | `nil` once a retry is acked, else `ErrConfirmLost` | yes, on a fresh confirm-mode channel, within `WithPublishRetries` |
+| caller `ctx` done while waiting | `ctx.Err()` | no |
+
+Every error also matches `ErrPublishFailed`. A lost confirm is never reported as success, but the re-publish can deliver the message twice, so de-duplicate on the consumer side (for example by `MessageID`). An ack does not mean the message was routed; an unroutable message is acked too.
 
 ---
 
@@ -159,7 +191,10 @@ conn, err := rabbitmq.Connect(ctx, url, rmqotel.Instrument()...) // uses global 
 ```go
 errors.Is(err, rabbitmq.ErrClosed)        // Conn was closed
 errors.Is(err, rabbitmq.ErrNotReady)      // no live connection before ctx expired
-errors.Is(err, rabbitmq.ErrPublishFailed) // publish retries exhausted (retryable)
+errors.Is(err, rabbitmq.ErrPublishFailed) // publish failed (retryable); every error below also matches it
+errors.Is(err, rabbitmq.ErrNacked)        // confirms: broker nacked
+errors.Is(err, rabbitmq.ErrConfirmTimeout) // confirms: no answer in time (outcome unknown)
+errors.Is(err, rabbitmq.ErrConfirmLost)   // confirms: channel dropped, retries spent (outcome unknown)
 errors.Is(err, rabbitmq.ErrInvalidQueue)  // bad queue shape (e.g. exclusive quorum queue)
 ```
 

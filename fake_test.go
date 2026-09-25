@@ -201,6 +201,45 @@ type fakeChannel struct {
 	declareErr   error
 	deliveries   chan amqp.Delivery
 	consumeCount int
+
+	// confirm mode
+	confirmMode  bool
+	confirmCalls int
+	confirmErr   error
+	confirmPlan  []confirmOutcome // outcome per confirmed publish; empty means ack
+	pending      []*fakeConfirm   // unresolved confirms, settled false on Close
+}
+
+// confirmOutcome scripts how the fake broker answers one confirmed publish.
+type confirmOutcome int
+
+const (
+	confirmAck   confirmOutcome = iota // broker acks
+	confirmNack                        // broker nacks
+	confirmNever                       // no answer until the channel closes
+	confirmDrop                        // the channel closes before the answer arrives
+)
+
+// fakeConfirm implements confirmation.
+type fakeConfirm struct {
+	once sync.Once
+	done chan struct{}
+	ack  bool
+}
+
+func newFakeConfirm() *fakeConfirm { return &fakeConfirm{done: make(chan struct{})} }
+
+func (c *fakeConfirm) resolve(ack bool) {
+	c.once.Do(func() { c.ack = ack; close(c.done) })
+}
+
+func (c *fakeConfirm) WaitContext(ctx context.Context) (bool, error) {
+	select {
+	case <-ctx.Done():
+		return false, ctx.Err()
+	case <-c.done:
+		return c.ack, nil
+	}
 }
 
 func newFakeChannel() *fakeChannel {
@@ -274,6 +313,15 @@ func (ch *fakeChannel) QueueBind(name, key, exchange string, _ bool, args amqp.T
 func (ch *fakeChannel) PublishWithContext(_ context.Context, exchange, key string, _, _ bool, msg amqp.Publishing) error {
 	ch.mu.Lock()
 	defer ch.mu.Unlock()
+	return ch.recordPublishLocked(exchange, key, msg)
+}
+
+// recordPublishLocked applies the scripted publish errors and records a
+// successful publish. ch.mu must be held.
+func (ch *fakeChannel) recordPublishLocked(exchange, key string, msg amqp.Publishing) error {
+	if ch.closed {
+		return amqp.ErrClosed
+	}
 	if len(ch.publishErrs) > 0 {
 		err := ch.publishErrs[0]
 		ch.publishErrs = ch.publishErrs[1:]
@@ -287,6 +335,54 @@ func (ch *fakeChannel) PublishWithContext(_ context.Context, exchange, key strin
 	ch.published = append(ch.published, msg)
 	ch.pubKeys = append(ch.pubKeys, key)
 	return nil
+}
+
+func (ch *fakeChannel) Confirm(_ bool) error {
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
+	ch.confirmCalls++
+	if ch.confirmErr != nil {
+		return ch.confirmErr
+	}
+	ch.confirmMode = true
+	return nil
+}
+
+func (ch *fakeChannel) publishDeferred(_ context.Context, exchange, key string, _, _ bool, msg amqp.Publishing) (confirmation, error) {
+	ch.mu.Lock()
+	if err := ch.recordPublishLocked(exchange, key, msg); err != nil {
+		ch.mu.Unlock()
+		return nil, err
+	}
+	if !ch.confirmMode {
+		ch.mu.Unlock()
+		return nil, nil
+	}
+	outcome := confirmAck
+	if len(ch.confirmPlan) > 0 {
+		outcome = ch.confirmPlan[0]
+		ch.confirmPlan = ch.confirmPlan[1:]
+	}
+	c := newFakeConfirm()
+	switch outcome {
+	case confirmAck:
+		c.resolve(true)
+	case confirmNack:
+		c.resolve(false)
+	case confirmNever, confirmDrop:
+		ch.pending = append(ch.pending, c)
+	}
+	ch.mu.Unlock()
+	if outcome == confirmDrop {
+		_ = ch.Close()
+	}
+	return c, nil
+}
+
+func (ch *fakeChannel) IsClosed() bool {
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
+	return ch.closed
 }
 
 func (ch *fakeChannel) Consume(_, _ string, _, _, _, _ bool, _ amqp.Table) (<-chan amqp.Delivery, error) {
@@ -340,7 +436,14 @@ func (ch *fakeChannel) Close() error {
 	ch.closed = true
 	listeners := ch.closeNotify
 	ch.closeNotify = nil
+	pending := ch.pending
+	ch.pending = nil
 	ch.mu.Unlock()
+	// Like amqp091, the channel is marked closed before outstanding confirms are
+	// settled as not-acked.
+	for _, c := range pending {
+		c.resolve(false)
+	}
 	for _, l := range listeners {
 		close(l)
 	}
@@ -398,4 +501,22 @@ func (ch *fakeChannel) qosArgs() *qosArgs {
 	ch.mu.Lock()
 	defer ch.mu.Unlock()
 	return ch.qos
+}
+
+func (ch *fakeChannel) inConfirmMode() bool {
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
+	return ch.confirmMode
+}
+
+func (ch *fakeChannel) confirmCallCount() int {
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
+	return ch.confirmCalls
+}
+
+func (ch *fakeChannel) pendingConfirms() int {
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
+	return len(ch.pending)
 }

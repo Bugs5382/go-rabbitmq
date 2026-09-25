@@ -26,6 +26,7 @@ OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -33,13 +34,19 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
+// DefaultConfirmTimeout is how long a publisher in confirm mode waits for the
+// broker to confirm each publish attempt, unless WithConfirmTimeout overrides it.
+const DefaultConfirmTimeout = 30 * time.Second
+
 // publisherOptions is the resolved construction config for a Publisher.
 type publisherOptions struct {
-	declare     *ExchangeConfig
-	contentType string
-	persistent  bool
-	mandatory   bool
-	maxRetries  int
+	declare        *ExchangeConfig
+	contentType    string
+	persistent     bool
+	mandatory      bool
+	maxRetries     int
+	confirms       bool
+	confirmTimeout time.Duration
 }
 
 // PublisherOption configures a Publisher at construction time.
@@ -77,6 +84,38 @@ func WithPublishRetries(n int) PublisherOption {
 	return func(o *publisherOptions) { o.maxRetries = n }
 }
 
+// WithConfirms puts the publisher's channel in publisher-confirm mode, on the
+// first publish and again on every channel re-opened after a drop or reconnect.
+// Publish then returns only after the broker has confirmed the message:
+//
+//   - ack: Publish returns nil. The broker has taken responsibility for the
+//     message (for a persistent message on a durable queue, it is on disk).
+//   - nack: Publish returns an error matching ErrNacked. It is not retried.
+//   - no answer within the confirm timeout (see WithConfirmTimeout): Publish
+//     returns an error matching ErrConfirmTimeout. It is not retried.
+//   - the channel or connection closes before the answer: the confirm is lost,
+//     never treated as an ack. Publish re-publishes on a fresh channel within the
+//     WithPublishRetries budget, so the message is delivered at least once and
+//     may be duplicated. Once the budget is spent it returns an error matching
+//     ErrConfirmLost.
+//
+// Every one of these errors also matches ErrPublishFailed, so the "keep the
+// message and try again later" handling stays the same. Consumers of a
+// confirmed stream should de-duplicate (for example on MessageID).
+//
+// A confirm does not mean the message was routed: an unroutable message is still
+// acked. Confirms are off by default.
+func WithConfirms() PublisherOption {
+	return func(o *publisherOptions) { o.confirms = true }
+}
+
+// WithConfirmTimeout bounds how long each publish attempt waits for its broker
+// confirm when WithConfirms is set. The default is DefaultConfirmTimeout. A value
+// <=0 removes the bound, so only the Publish ctx limits the wait.
+func WithConfirmTimeout(d time.Duration) PublisherOption {
+	return func(o *publisherOptions) { o.confirmTimeout = d }
+}
+
 // Publisher publishes to one exchange over a Conn. It lazily opens a channel,
 // re-opens (and optionally re-declares its exchange) after a drop, and retries a
 // failed publish within bounded backoff. A Publisher is safe for concurrent use.
@@ -94,9 +133,10 @@ type Publisher struct {
 // name.
 func (c *Conn) NewPublisher(exchange string, opts ...PublisherOption) *Publisher {
 	o := publisherOptions{
-		contentType: "application/json",
-		persistent:  true,
-		maxRetries:  3,
+		contentType:    "application/json",
+		persistent:     true,
+		maxRetries:     3,
+		confirmTimeout: DefaultConfirmTimeout,
 	}
 	for _, opt := range opts {
 		opt(&o)
@@ -176,6 +216,12 @@ func (p *Publisher) channel(ctx context.Context) (wireChannel, error) {
 	if err != nil {
 		return nil, err
 	}
+	if p.opts.confirms {
+		if err := ch.Confirm(false); err != nil {
+			_ = ch.Close()
+			return nil, fmt.Errorf("enable publisher confirms: %w", err)
+		}
+	}
 	if p.opts.declare != nil {
 		if err := declareExchangeOn(ch, *p.opts.declare); err != nil {
 			_ = ch.Close()
@@ -187,9 +233,16 @@ func (p *Publisher) channel(ctx context.Context) (wireChannel, error) {
 }
 
 // resetChannel drops the cached channel so the next publish opens a fresh one.
-func (p *Publisher) resetChannel() {
+// When failed is non-nil the cache is only cleared if it still holds that
+// channel, so a concurrent publish that already opened a replacement keeps it.
+func (p *Publisher) resetChannel(failed wireChannel) {
 	p.mu.Lock()
 	ch := p.ch
+	if failed != nil && ch != failed {
+		p.mu.Unlock()
+		_ = failed.Close()
+		return
+	}
 	p.ch = nil
 	p.mu.Unlock()
 	if ch != nil {
@@ -202,6 +255,11 @@ func (p *Publisher) resetChannel() {
 // within the configured bounded backoff. It returns an error (wrapping
 // ErrPublishFailed) only after the retry budget is exhausted, so an outbox worker
 // can keep the message and try again later.
+//
+// Without WithConfirms, a nil error means the message was written to the
+// channel, not that the broker accepted it. With WithConfirms, a nil error means
+// the broker acked it; see WithConfirms for how nacks, timeouts and reconnects
+// are reported.
 //
 // Any publish interceptors registered on the Conn (for example the OTel adapter's
 // tracing interceptor) wrap the whole call: they run once per Publish, may mutate
@@ -235,7 +293,9 @@ func (p *Publisher) Publish(ctx context.Context, routingKey string, body []byte,
 }
 
 // publishWithRetry ensures a live channel and sends msg, retrying within bounded
-// backoff before returning ErrPublishFailed.
+// backoff before returning ErrPublishFailed. A send failure or a confirm lost to a
+// channel drop is retried; a nack, a confirm timeout or a cancelled ctx while
+// waiting for a confirm ends the call at once.
 func (p *Publisher) publishWithRetry(ctx context.Context, exchange, routingKey string, msg *amqp.Publishing) error {
 	backoff := p.conn.opts.backoff
 	var lastErr error
@@ -252,17 +312,60 @@ func (p *Publisher) publishWithRetry(ctx context.Context, exchange, routingKey s
 			lastErr = err
 			continue
 		}
-		err = ch.PublishWithContext(ctx, exchange, routingKey, p.opts.mandatory, false, *msg)
+		retry, err := p.send(ctx, ch, exchange, routingKey, msg)
+		p.conn.opts.observer.OnPublish(exchange, routingKey, err)
 		if err == nil {
-			p.conn.opts.observer.OnPublish(exchange, routingKey, nil)
 			return nil
 		}
+		if !retry {
+			p.conn.log.Warnf("rabbitmq: publish to %q/%q failed: %v", exchange, routingKey, err)
+			return fmt.Errorf("%w: %w", ErrPublishFailed, err)
+		}
 		lastErr = err
-		p.conn.opts.observer.OnPublish(exchange, routingKey, err)
 		p.conn.log.Warnf("rabbitmq: publish to %q/%q failed (attempt %d): %v", exchange, routingKey, attempt+1, err)
-		p.resetChannel()
+		p.resetChannel(ch)
 	}
 	return fmt.Errorf("%w: %w", ErrPublishFailed, lastErr)
+}
+
+// send performs one publish attempt on ch and, in confirm mode, waits for the
+// broker's answer. retry reports whether a failure should be retried on a fresh
+// channel.
+func (p *Publisher) send(ctx context.Context, ch wireChannel, exchange, routingKey string, msg *amqp.Publishing) (retry bool, err error) {
+	if !p.opts.confirms {
+		return true, ch.PublishWithContext(ctx, exchange, routingKey, p.opts.mandatory, false, *msg)
+	}
+	conf, err := ch.publishDeferred(ctx, exchange, routingKey, p.opts.mandatory, false, *msg)
+	if err != nil {
+		return true, err
+	}
+	if conf == nil {
+		// The channel is not in confirm mode, which channel() rules out. Re-open
+		// rather than report an unconfirmed publish as confirmed.
+		return true, errors.New("rabbitmq: channel is not in confirm mode")
+	}
+
+	waitCtx := ctx
+	if p.opts.confirmTimeout > 0 {
+		var cancel context.CancelFunc
+		waitCtx, cancel = context.WithTimeout(ctx, p.opts.confirmTimeout)
+		defer cancel()
+	}
+	acked, err := conf.WaitContext(waitCtx)
+	switch {
+	case err != nil && ctx.Err() != nil:
+		return false, ctx.Err()
+	case err != nil:
+		return false, fmt.Errorf("%w after %s", ErrConfirmTimeout, p.opts.confirmTimeout)
+	case acked:
+		return false, nil
+	case ch.IsClosed():
+		// amqp091 marks the channel closed before it settles outstanding
+		// confirms as not-acked, so this is a drop, not a nack.
+		return true, ErrConfirmLost
+	default:
+		return false, ErrNacked
+	}
 }
 
 // PublishJSON marshals v to JSON and publishes it with Content-Type
@@ -278,6 +381,6 @@ func (p *Publisher) PublishJSON(ctx context.Context, routingKey string, v any, o
 
 // Close releases the publisher's channel. The underlying Conn is left open.
 func (p *Publisher) Close() error {
-	p.resetChannel()
+	p.resetChannel(nil)
 	return nil
 }

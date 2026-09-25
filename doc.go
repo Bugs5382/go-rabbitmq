@@ -19,7 +19,8 @@
 //     background and exposes health via IsClosed, Healthy and Reconnects.
 //   - Publisher is created from a Conn and an exchange. Publish ensures a live
 //     channel and retries within bounded backoff before returning an error, so an
-//     outbox worker can simply try again later.
+//     outbox worker can simply try again later. WithConfirms makes Publish wait
+//     for the broker's publisher confirm, for at-least-once delivery.
 //   - Consume runs a consumer that re-declares its queue and bindings and resumes
 //     after any reconnect, with manual acknowledgement driven by the handler's
 //     returned error.

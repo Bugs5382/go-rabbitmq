@@ -33,6 +33,23 @@ if err := pub.PublishJSON(ctx, "order.created", order); err != nil {
 }
 ```
 
+By default a nil error means the message left the client. Add `WithConfirms()` and `Publish` waits for the broker's publisher confirm, so nil means the broker acked it. The channel goes back into confirm mode after every reconnect.
+
+```go
+pub := conn.NewPublisher("events", rabbitmq.WithConfirms())
+err := pub.PublishJSON(ctx, "order.created", order, rabbitmq.WithMessageID(id))
+switch {
+case err == nil:
+	// acked: safe to mark the outbox row sent
+case errors.Is(err, rabbitmq.ErrNacked):
+	// the broker refused it
+case errors.Is(err, rabbitmq.ErrConfirmTimeout), errors.Is(err, rabbitmq.ErrConfirmLost):
+	// outcome unknown: keep the row; a retry may duplicate
+}
+```
+
+A nack or a confirm timeout (`WithConfirmTimeout`, default 30s) is returned straight away. If the channel or connection drops while a confirm is outstanding, the message is re-published on a fresh channel within the retry budget, and `ErrConfirmLost` is returned once that is spent. A lost confirm is never reported as success. Delivery is at least once, so consumers should de-duplicate.
+
 ## 📥 Consume
 
 A consumer re-declares its topology and resumes after any reconnect. Your handler's returned error drives the ack (requeue configurable), so it survives broker restarts.

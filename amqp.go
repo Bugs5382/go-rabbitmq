@@ -43,9 +43,10 @@ type wireConn interface {
 	Close() error
 }
 
-// wireChannel is the subset of *amqp.Channel the library uses. The method set is
-// deliberately identical to the concrete channel so *amqp.Channel satisfies it
-// directly.
+// wireChannel is the subset of *amqp.Channel the library uses. Every method but
+// publishDeferred has the concrete channel's signature; realChannel adds
+// publishDeferred so the confirm path can be faked (amqp.DeferredConfirmation
+// cannot be constructed outside amqp091).
 type wireChannel interface {
 	ExchangeDeclare(name, kind string, durable, autoDelete, internal, noWait bool, args amqp.Table) error
 	QueueDeclare(name string, durable, autoDelete, exclusive, noWait bool, args amqp.Table) (amqp.Queue, error)
@@ -57,6 +58,35 @@ type wireChannel interface {
 	Nack(tag uint64, multiple, requeue bool) error
 	NotifyClose(receiver chan *amqp.Error) chan *amqp.Error
 	Close() error
+	IsClosed() bool
+
+	// Confirm puts the channel in publisher-confirm mode.
+	Confirm(noWait bool) error
+	// publishDeferred publishes and returns the pending broker confirmation. It
+	// returns a nil confirmation when the channel is not in confirm mode.
+	publishDeferred(ctx context.Context, exchange, key string, mandatory, immediate bool, msg amqp.Publishing) (confirmation, error)
+}
+
+// confirmation is a pending publisher confirm. *amqp.DeferredConfirmation
+// satisfies it. WaitContext returns (true, nil) for an ack and (false, nil) for a
+// nack or for a channel that closed before the broker answered.
+type confirmation interface {
+	WaitContext(ctx context.Context) (bool, error)
+}
+
+// realChannel adapts *amqp.Channel to wireChannel.
+type realChannel struct {
+	*amqp.Channel
+}
+
+// publishDeferred publishes with a deferred confirm. The nil check keeps a nil
+// *amqp.DeferredConfirmation from turning into a non-nil interface value.
+func (c realChannel) publishDeferred(ctx context.Context, exchange, key string, mandatory, immediate bool, msg amqp.Publishing) (confirmation, error) {
+	dc, err := c.PublishWithDeferredConfirmWithContext(ctx, exchange, key, mandatory, immediate, msg)
+	if err != nil || dc == nil {
+		return nil, err
+	}
+	return dc, nil
 }
 
 // dialFunc establishes a connection. The production implementation dials with
@@ -76,7 +106,7 @@ func (c realConn) Channel() (wireChannel, error) {
 	if err != nil {
 		return nil, err
 	}
-	return ch, nil
+	return realChannel{ch}, nil
 }
 
 // defaultDial is the production dialFunc.
