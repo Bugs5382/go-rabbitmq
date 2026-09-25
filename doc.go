@@ -23,7 +23,9 @@
 //     for the broker's publisher confirm, for at-least-once delivery.
 //   - Consume runs a consumer that re-declares its queue and bindings and resumes
 //     after any reconnect, with manual settlement (ack, requeue or dead-letter)
-//     driven by the handler's returned error.
+//     driven by the handler's returned error. NewConsumer returns the same
+//     consumer as a Consumer whose Ready and Status report whether it is
+//     actually consuming, for readiness probes.
 //   - The topology helpers (DeclareExchange, DeclareQueue, BindQueue,
 //     DeclareTopology) declare exchanges, queues and bindings idempotently and
 //     guard the quorum-vs-classic queue rules.

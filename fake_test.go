@@ -200,6 +200,7 @@ type fakeChannel struct {
 	publishErrs  []error
 	consumeErr   error
 	declareErr   error
+	bindErr      error // fails QueueBind only
 	deliveries   chan amqp.Delivery
 	consumeCount int
 
@@ -311,6 +312,9 @@ func (ch *fakeChannel) QueueBind(name, key, exchange string, _ bool, args amqp.T
 	defer ch.mu.Unlock()
 	if ch.declareErr != nil {
 		return ch.declareErr
+	}
+	if ch.bindErr != nil {
+		return ch.bindErr
 	}
 	ch.binds = append(ch.binds, BindArgs{name, key, exchange, args})
 	return nil
