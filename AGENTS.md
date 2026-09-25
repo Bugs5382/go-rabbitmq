@@ -31,7 +31,7 @@ go get github.com/Bugs5382/go-rabbitmq
 
 5. **Ack is driven by your handler's error — don't ack yourself.** Return `nil` to ack, an error to nack. `RequeueOnError` (default `true`) decides requeue vs drop. A handler panic is recovered and treated as an error. `Delivery` is a read-only value; there is no `d.Ack()`.
 
-6. **Quorum queues have shape rules — the library guards them.** A `QueueQuorum` queue **must be named** and may **not** be exclusive or auto-delete; it is always durable. Server-named / exclusive / auto-delete queues must be `QueueClassic`. An invalid combo returns `ErrInvalidQueue` before touching the broker. Check with `errors.Is(err, rabbitmq.ErrInvalidQueue)`.
+6. **Quorum queues have shape rules — the library guards them.** A `QueueQuorum` queue **must be named** and may **not** be exclusive or auto-delete; it is always durable. Server-named / exclusive / auto-delete queues must be `QueueClassic`, and the library always declares them with `x-queue-type: classic` so a quorum-default broker cannot override the type. A durable, named classic queue is sent without `x-queue-type` (broker default applies); pin it with `Args: amqp.Table{"x-queue-type": "classic"}`. An invalid combo returns `ErrInvalidQueue` before touching the broker. Check with `errors.Is(err, rabbitmq.ErrInvalidQueue)`.
 
 7. **Zero values are sensible defaults.** `ExchangeConfig{}` ⇒ durable topic. `QueueConfig{}` ⇒ durable classic. Use `.Transient()` for a non-durable exchange/queue; use `ConsumerConfig.NoRequeue()` to drop rejects instead of requeueing.
 

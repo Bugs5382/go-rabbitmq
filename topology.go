@@ -36,6 +36,12 @@ type QueueType string
 const (
 	// QueueClassic is the traditional (non-replicated) queue. It is the default
 	// and the only type that may be exclusive, auto-delete or server-named.
+	//
+	// For those classic-only shapes the declare always carries
+	// x-queue-type=classic, so a broker configured with
+	// default_queue_type=quorum still creates a classic queue. A durable, named
+	// classic queue is declared without x-queue-type and so follows the broker
+	// default; set QueueConfig.Args["x-queue-type"] to "classic" to pin it.
 	QueueClassic QueueType = "classic"
 	// QueueQuorum is a replicated, Raft-based durable queue. It must be durable
 	// and named, and may not be exclusive or auto-delete.
@@ -79,7 +85,9 @@ type QueueConfig struct {
 	AutoDelete bool
 	Exclusive  bool
 	NoWait     bool
-	Args       amqp.Table
+	// Args are extra declare arguments. A caller-supplied x-queue-type is kept
+	// for classic queues; for QueueQuorum it is always set to "quorum".
+	Args amqp.Table
 
 	durableSet bool
 }
@@ -118,17 +126,46 @@ func (q QueueConfig) validate() error {
 	return nil
 }
 
-// args returns the declare arguments, injecting x-queue-type for quorum queues
-// without mutating the caller's map.
+// classicOnly reports whether the queue shape can only ever be a classic queue:
+// server-named, exclusive or auto-delete. No other queue type accepts these
+// shapes, so an existing queue of this shape is always classic.
+func (q QueueConfig) classicOnly() bool {
+	return q.Name == "" || q.Exclusive || q.AutoDelete
+}
+
+// args returns the declare arguments without mutating the caller's map.
+//
+// A quorum queue always gets x-queue-type=quorum. A classic-only shape gets
+// x-queue-type=classic unless the caller already set one, so a broker whose
+// default_queue_type is quorum cannot turn it into a quorum declare that the
+// broker then rejects (issue #3). Asserting the type there is always safe: no
+// existing queue of that shape can have a different type.
+//
+// A durable, named classic queue is sent without x-queue-type, as in v1.0.0, so
+// the broker default applies. Stating classic there would make re-declaring a
+// queue that a quorum-default broker already created as quorum fail with
+// PRECONDITION_FAILED. Set Args["x-queue-type"] to pin the type explicitly.
 func (q QueueConfig) args() amqp.Table {
-	if q.Type != QueueQuorum {
+	switch {
+	case q.Type == QueueQuorum:
+		return withQueueType(q.Args, string(QueueQuorum))
+	case q.classicOnly():
+		if _, set := q.Args["x-queue-type"]; set {
+			return q.Args
+		}
+		return withQueueType(q.Args, string(QueueClassic))
+	default:
 		return q.Args
 	}
-	out := amqp.Table{}
-	for k, v := range q.Args {
+}
+
+// withQueueType returns a copy of args with x-queue-type set to typ.
+func withQueueType(args amqp.Table, typ string) amqp.Table {
+	out := make(amqp.Table, len(args)+1)
+	for k, v := range args {
 		out[k] = v
 	}
-	out["x-queue-type"] = "quorum"
+	out["x-queue-type"] = typ
 	return out
 }
 
