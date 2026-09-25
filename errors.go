@@ -38,6 +38,23 @@ var (
 	// retryable and try again later.
 	ErrPublishFailed = errors.New("rabbitmq: publish failed after retries")
 
+	// ErrNacked is returned (wrapped with ErrPublishFailed) when a publisher in
+	// confirm mode receives a broker nack. The broker did not take the message;
+	// keep it and try again later. A nack is not retried inside Publish.
+	ErrNacked = errors.New("rabbitmq: broker nacked the message")
+
+	// ErrConfirmTimeout is returned (wrapped with ErrPublishFailed) when the
+	// broker does not confirm a publish within the publisher's confirm timeout.
+	// The outcome is unknown: the broker may still have the message, so a retry
+	// can produce a duplicate. It is not retried inside Publish.
+	ErrConfirmTimeout = errors.New("rabbitmq: timed out waiting for publisher confirm")
+
+	// ErrConfirmLost is returned (wrapped with ErrPublishFailed) when the channel
+	// or connection closed while confirms were outstanding and every retry was
+	// spent. The outcome of the last attempt is unknown, as with
+	// ErrConfirmTimeout.
+	ErrConfirmLost = errors.New("rabbitmq: channel closed before the publish was confirmed")
+
 	// ErrInvalidQueue is returned when a QueueConfig violates a broker rule, most
 	// commonly a quorum queue that is also exclusive, auto-delete or server-named.
 	ErrInvalidQueue = errors.New("rabbitmq: invalid queue configuration")
