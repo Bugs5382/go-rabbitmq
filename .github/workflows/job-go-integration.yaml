@@ -1,0 +1,84 @@
+# MIT License
+#
+# Copyright (c) 2026 Shane
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+name: Integration
+# Runs the broker integration tests (-tags integration) against a real RabbitMQ
+# service container. They run twice: on the default vhost, and on a vhost whose
+# default queue type is quorum, which is where an unasserted classic queue type
+# fails. RABBITMQ_TEST_REQUIRED makes a missing broker URL fail the run instead of
+# skipping every test.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    paths-ignore: ['**.md']
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  integration:
+    name: 🐇 Integration (RabbitMQ)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      rabbitmq:
+        image: rabbitmq:4-management
+        env:
+          # guest is limited to loopback connections, and the runner reaches the
+          # container through a published port, so use a dedicated user.
+          RABBITMQ_DEFAULT_USER: ci
+          RABBITMQ_DEFAULT_PASS: ci
+        ports:
+          - 5672:5672
+          - 15672:15672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q check_port_connectivity"
+          --health-interval 5s
+          --health-timeout 10s
+          --health-retries 30
+          --health-start-period 10s
+    env:
+      RABBITMQ_TEST_REQUIRED: '1'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.x'
+      - name: Create a quorum-default vhost
+        run: |
+          api=http://localhost:15672/api
+          curl -fsS -u ci:ci -X PUT -H 'content-type: application/json' \
+            -d '{"default_queue_type":"quorum"}' "$api/vhosts/quorum-default"
+          curl -fsS -u ci:ci -X PUT -H 'content-type: application/json' \
+            -d '{"configure":".*","write":".*","read":".*"}' "$api/permissions/quorum-default/ci"
+          curl -fsS -u ci:ci "$api/vhosts/quorum-default" | grep -q '"default_queue_type":"quorum"'
+      - name: Integration tests (default vhost)
+        env:
+          RABBITMQ_TEST_URL: amqp://ci:ci@localhost:5672/
+        run: go test -tags integration -count=1 -timeout 5m -v ./...
+      - name: Integration tests (quorum-default vhost)
+        env:
+          RABBITMQ_TEST_URL: amqp://ci:ci@localhost:5672/quorum-default
+        run: go test -tags integration -count=1 -timeout 5m -v -run Integration ./...

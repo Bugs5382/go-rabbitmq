@@ -1,10 +1,11 @@
 //go:build integration
 
 // Package rabbitmq integration tests exercise the library against a real broker.
-// They are excluded from the default build so CI stays green without one. Run
-// them with a broker reachable at RABBITMQ_TEST_URL:
+// They are excluded from the default build and skip when RABBITMQ_TEST_URL is
+// unset. CI runs them against a RabbitMQ service container (see
+// .github/workflows/job-go-integration.yaml). Run them locally with:
 //
-//	docker run -d --rm -p 5672:5672 rabbitmq:3-management
+//	docker run -d --rm -p 5672:5672 rabbitmq:4-management
 //	RABBITMQ_TEST_URL=amqp://guest:guest@localhost:5672/ go test -tags integration -run Integration ./...
 package rabbitmq_test
 
@@ -41,10 +42,17 @@ import (
 	rabbitmq "github.com/Bugs5382/go-rabbitmq"
 )
 
+// brokerURL returns the broker URL from RABBITMQ_TEST_URL and skips the test when
+// it is unset, so a local run without a broker still passes. CI sets
+// RABBITMQ_TEST_REQUIRED as well, which turns a missing URL into a failure: a
+// broken service wiring must not pass as a run of skipped tests.
 func brokerURL(t *testing.T) string {
 	t.Helper()
 	url := os.Getenv("RABBITMQ_TEST_URL")
 	if url == "" {
+		if os.Getenv("RABBITMQ_TEST_REQUIRED") != "" {
+			t.Fatal("RABBITMQ_TEST_REQUIRED is set but RABBITMQ_TEST_URL is empty")
+		}
 		t.Skip("set RABBITMQ_TEST_URL to run integration tests")
 	}
 	return url
