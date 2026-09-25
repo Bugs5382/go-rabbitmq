@@ -216,7 +216,7 @@ func (c *Conn) setupConsumer(ch wireChannel, cfg ConsumerConfig) (string, error)
 			return "", fmt.Errorf("declare exchange %q: %w", cfg.Exchange.Name, err)
 		}
 	}
-	q, err := declareQueueOn(ch, cfg.Queue)
+	q, err := declareQueueOn(ch, cfg.Queue, c.log)
 	if err != nil {
 		return "", fmt.Errorf("declare queue %q: %w", cfg.Queue.Name, err)
 	}

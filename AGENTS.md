@@ -35,6 +35,8 @@ go get github.com/Bugs5382/go-rabbitmq
 
 7. **Zero values are sensible defaults.** `ExchangeConfig{}` ⇒ durable topic. `QueueConfig{}` ⇒ durable classic. Use `.Transient()` for a non-durable exchange/queue; use `ConsumerConfig.NoRequeue()` to drop rejects instead of requeueing.
 
+8. **On RabbitMQ 4, a transient queue must be exclusive.** RabbitMQ 4 refuses a non-durable, non-exclusive queue by default (deprecated feature `transient_nonexcl_queues`). Write `QueueConfig{Exclusive: true, AutoDelete: true}.Transient()` for a private scratch queue, or keep the queue durable and clean it up with `AutoDelete: true` or `Args: amqp.Table{"x-expires": int32(ms)}`. Never write `QueueConfig{Name: "x", AutoDelete: true}.Transient()`. The library does not block the shape (RabbitMQ 3 accepts it); a refusing broker yields `ErrInvalidQueue` wrapping the broker's `*amqp.Error`, with the fix in the message.
+
 ---
 
 ## Connect
@@ -231,7 +233,7 @@ errors.Is(err, rabbitmq.ErrPublishFailed) // publish failed (retryable); every e
 errors.Is(err, rabbitmq.ErrNacked)        // confirms: broker nacked
 errors.Is(err, rabbitmq.ErrConfirmTimeout) // confirms: no answer in time (outcome unknown)
 errors.Is(err, rabbitmq.ErrConfirmLost)   // confirms: channel dropped, retries spent (outcome unknown)
-errors.Is(err, rabbitmq.ErrInvalidQueue)  // bad queue shape (e.g. exclusive quorum queue)
+errors.Is(err, rabbitmq.ErrInvalidQueue)  // bad queue shape (e.g. exclusive quorum queue, or a transient non-exclusive queue on RabbitMQ 4)
 
 // returned by a Handler to pick the settlement of one message
 return fmt.Errorf("...: %w", rabbitmq.ErrRequeue)    // nack, requeue

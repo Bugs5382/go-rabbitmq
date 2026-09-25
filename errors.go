@@ -70,5 +70,8 @@ var (
 
 	// ErrInvalidQueue is returned when a QueueConfig violates a broker rule, most
 	// commonly a quorum queue that is also exclusive, auto-delete or server-named.
+	// Those are caught before the declare. It is also returned when a RabbitMQ 4
+	// broker refuses a transient queue that is not exclusive; that error wraps
+	// the broker's *amqp.Error as well, and its message names the fix.
 	ErrInvalidQueue = errors.New("rabbitmq: invalid queue configuration")
 )
