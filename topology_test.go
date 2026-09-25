@@ -151,3 +151,72 @@ func TestDeclareTopologyOnPropagatesInvalidQueue(t *testing.T) {
 		t.Errorf("expected ErrInvalidQueue to propagate, got %v", err)
 	}
 }
+
+// Issue #3: a queue shape that can only be classic (server-named, exclusive or
+// auto-delete) must state x-queue-type=classic on the wire, so a broker whose
+// default_queue_type is quorum cannot turn it into a quorum declare and fail it
+// with PRECONDITION_FAILED.
+func TestClassicOnlyQueueShapesAssertQueueType(t *testing.T) {
+	t.Parallel()
+	cases := map[string]QueueConfig{
+		"server-named": {Name: ""},
+		"exclusive":    {Name: "q", Exclusive: true},
+		"auto-delete":  {Name: "q", AutoDelete: true},
+		"explicit classic, server-named, transient": QueueConfig{
+			Name: "", Type: QueueClassic, Exclusive: true, AutoDelete: true,
+		}.Transient(),
+	}
+	for name, cfg := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if got := cfg.normalize().args()["x-queue-type"]; got != "classic" {
+				t.Errorf("x-queue-type = %v, want classic", got)
+			}
+		})
+	}
+}
+
+func TestClassicOnlyQueueDoesNotMutateCallerArgs(t *testing.T) {
+	t.Parallel()
+	caller := map[string]any{"x-message-ttl": 1000}
+	args := QueueConfig{Name: "", Args: caller}.normalize().args()
+	if args["x-queue-type"] != "classic" || args["x-message-ttl"] != 1000 {
+		t.Errorf("args = %v, want x-queue-type=classic and the caller's ttl", args)
+	}
+	if _, ok := caller["x-queue-type"]; ok {
+		t.Error("args() must not mutate the caller's map")
+	}
+}
+
+func TestClassicOnlyQueueKeepsCallerQueueType(t *testing.T) {
+	t.Parallel()
+	args := QueueConfig{Name: "", Args: map[string]any{"x-queue-type": "custom"}}.normalize().args()
+	if args["x-queue-type"] != "custom" {
+		t.Errorf("caller-supplied x-queue-type was overridden: %v", args["x-queue-type"])
+	}
+}
+
+// A durable, named classic queue keeps its v1 wire shape (no x-queue-type), so
+// re-declaring a queue that a quorum-default broker already created as quorum
+// does not start failing after an upgrade.
+func TestDurableNamedClassicQueueLeavesTypeToBroker(t *testing.T) {
+	t.Parallel()
+	for _, typ := range []QueueType{"", QueueClassic} {
+		if _, ok := (QueueConfig{Name: "orders", Type: typ}).normalize().args()["x-queue-type"]; ok {
+			t.Errorf("type %q: durable named classic queue must not send x-queue-type", typ)
+		}
+	}
+}
+
+func TestDeclareServerNamedQueueSendsClassicType(t *testing.T) {
+	t.Parallel()
+	ch := newFakeChannel()
+	cfg := QueueConfig{Name: "", Type: QueueClassic, AutoDelete: true, Exclusive: true}.Transient()
+	if _, err := declareQueueOn(ch, cfg); err != nil {
+		t.Fatalf("declareQueueOn: %v", err)
+	}
+	q := ch.declaredQueues()
+	if len(q) != 1 || q[0].Args["x-queue-type"] != "classic" {
+		t.Errorf("declared queue args = %+v, want x-queue-type=classic", q)
+	}
+}
