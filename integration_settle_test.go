@@ -54,14 +54,16 @@ func TestIntegrationSettlement(t *testing.T) {
 	events, dlx := "it.settle.events."+suffix, "it.settle.dlx."+suffix
 	queue, dlq := "it.settle.work."+suffix, "it.settle.dead."+suffix
 
-	// Dead-letter side: a fanout exchange and a queue that collects rejects.
+	// Dead-letter side: a fanout exchange and a queue that collects rejects. The
+	// queues are durable auto-delete rather than transient: RabbitMQ 4 refuses
+	// transient non-exclusive queues by default (transient_nonexcl_queues).
 	if err := conn.DeclareTopology(ctx, rabbitmq.Topology{
 		Exchanges: []rabbitmq.ExchangeConfig{
 			rabbitmq.ExchangeConfig{Name: events, Kind: "topic", AutoDelete: true}.Transient(),
 			rabbitmq.ExchangeConfig{Name: dlx, Kind: "fanout", AutoDelete: true}.Transient(),
 		},
 		Queues: []rabbitmq.QueueConfig{
-			rabbitmq.QueueConfig{Name: dlq, AutoDelete: true}.Transient(),
+			rabbitmq.QueueConfig{Name: dlq, AutoDelete: true},
 		},
 		Bindings: []rabbitmq.BindingConfig{{Queue: dlq, Exchange: dlx}},
 	}); err != nil {
@@ -79,7 +81,7 @@ func TestIntegrationSettlement(t *testing.T) {
 			Name:       queue,
 			AutoDelete: true,
 			Args:       amqp.Table{"x-dead-letter-exchange": dlx},
-		}.Transient(),
+		},
 		Bindings: []rabbitmq.BindingConfig{{Exchange: events, RoutingKey: "#"}},
 	}
 	var wg sync.WaitGroup
@@ -125,7 +127,7 @@ func TestIntegrationSettlement(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		_ = conn.Consume(ctx, rabbitmq.ConsumerConfig{
-			Queue: rabbitmq.QueueConfig{Name: dlq, AutoDelete: true}.Transient(),
+			Queue: rabbitmq.QueueConfig{Name: dlq, AutoDelete: true},
 		}, func(_ context.Context, d rabbitmq.Delivery) error {
 			select {
 			case dead <- d:
