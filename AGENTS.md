@@ -14,7 +14,7 @@ go get github.com/Bugs5382/go-rabbitmq
 
 | Import path | What you use it for | Key exports |
 |---|---|---|
-| `github.com/Bugs5382/go-rabbitmq` | Everything: connect, publish, consume, declare topology. | `Connect`, `Conn`, `Option` (`WithBackoff`, `WithTLS`, `WithLogger`, `WithObserver`, `WithHeartbeat`, `WithVhost`, `WithClientProperties`, `WithPublishInterceptor`, `WithConsumeInterceptor`), `Backoff`, `DefaultBackoff`, `Publisher`, `PublishOption`, `PublisherOption` (`WithConfirms`, `WithConfirmTimeout`, ...), `Delivery`, `Handler`, `ConsumerConfig`, `ExchangeConfig`, `QueueConfig`, `BindingConfig`, `Topology`, `QueueType` (`QueueClassic`/`QueueQuorum`), `Logger`, `Observer`/`NopObserver`, `PublishInterceptor`/`ConsumeInterceptor`, sentinel errors. |
+| `github.com/Bugs5382/go-rabbitmq` | Everything: connect, publish, consume, declare topology. | `Connect`, `Conn`, `Option` (`WithBackoff`, `WithTLS`, `WithLogger`, `WithObserver`, `WithHeartbeat`, `WithVhost`, `WithClientProperties`, `WithPublishInterceptor`, `WithConsumeInterceptor`), `Backoff`, `DefaultBackoff`, `Publisher`, `PublishOption`, `PublisherOption` (`WithConfirms`, `WithConfirmTimeout`, ...), `Delivery`, `Handler`, `ConsumerConfig`, `ErrRequeue`/`ErrDeadLetter`, `ExchangeConfig`, `QueueConfig`, `BindingConfig`, `Topology`, `QueueType` (`QueueClassic`/`QueueQuorum`), `Logger`, `Observer`/`NopObserver`, `PublishInterceptor`/`ConsumeInterceptor`, sentinel errors. |
 | `github.com/Bugs5382/go-rabbitmq/otel` | OpenTelemetry tracing + metrics. | `Instrument(...) []rabbitmq.Option`, `PublishInterceptor`, `ConsumeInterceptor`, `WithTracerProvider`, `WithMeterProvider`, `WithPropagator`. |
 
 ---
@@ -29,7 +29,7 @@ go get github.com/Bugs5382/go-rabbitmq
 
 4. **`Consume` blocks; run it in a goroutine.** It re-declares its exchange/queue/bindings and resumes after every reconnect. It returns `ctx.Err()` when your `ctx` is cancelled, or `ErrClosed` if the `Conn` is closed. Deliveries are dispatched **sequentially**; for concurrency, fan out inside your handler (respect `Prefetch` for backpressure).
 
-5. **Ack is driven by your handler's error — don't ack yourself.** Return `nil` to ack, an error to nack. `RequeueOnError` (default `true`) decides requeue vs drop. A handler panic is recovered and treated as an error. `Delivery` is a read-only value; there is no `d.Ack()`.
+5. **Settlement is driven by your handler's error — don't ack yourself.** Return `nil` to ack. Return an error matching `ErrRequeue` to nack with requeue, or `ErrDeadLetter` to reject without requeue (dead-lettered if the queue has `x-dead-letter-exchange`). Any other error nacks, and `RequeueOnError` (default `true`) decides requeue vs drop. Wrapping works (`errors.Is`); `ErrDeadLetter` wins if both match. A handler panic is recovered and treated as a plain error. If the channel closed while the handler ran, nothing is settled and the broker redelivers. `Delivery` is a read-only value; there is no `d.Ack()`.
 
 6. **Quorum queues have shape rules — the library guards them.** A `QueueQuorum` queue **must be named** and may **not** be exclusive or auto-delete; it is always durable. Server-named / exclusive / auto-delete queues must be `QueueClassic`, and the library always declares them with `x-queue-type: classic` so a quorum-default broker cannot override the type. A durable, named classic queue is sent without `x-queue-type` (broker default applies); pin it with `Args: amqp.Table{"x-queue-type": "classic"}`. An invalid combo returns `ErrInvalidQueue` before touching the broker. Check with `errors.Is(err, rabbitmq.ErrInvalidQueue)`.
 
@@ -129,7 +129,7 @@ cfg := rabbitmq.ConsumerConfig{
 	Queue:    rabbitmq.QueueConfig{Name: "orders", Type: rabbitmq.QueueQuorum},
 	Bindings: []rabbitmq.BindingConfig{{Exchange: "events", RoutingKey: "orders.*"}}, // empty Queue ⇒ resolved queue
 	Prefetch: 20,   // QoS unacked in flight (default 10)
-	// AutoAck: false (default) — manual ack driven by the handler error
+	// AutoAck: false (default) — manual settlement driven by the handler error
 }
 
 go func() {
@@ -148,7 +148,43 @@ go func() {
 
 `Delivery` fields: `Body`, `RoutingKey`, `Exchange`, `ContentType`, `Headers`, `DeliveryTag`, `Redelivered`, `MessageID`, `CorrelationID`, `ReplyTo`, `Type`, `AppID`, `Priority`, `Timestamp`.
 
-To drop poison messages instead of requeuing forever, use `cfg.NoRequeue()` and bind the queue to a dead-letter exchange.
+### Per-message settlement
+
+```go
+cfg := rabbitmq.ConsumerConfig{
+	Queue: rabbitmq.QueueConfig{
+		Name: "orders",
+		Type: rabbitmq.QueueQuorum,
+		Args: amqp.Table{"x-dead-letter-exchange": "events.dlx"}, // where rejects go
+	},
+	Bindings: []rabbitmq.BindingConfig{{Exchange: "events", RoutingKey: "orders.*"}},
+}
+
+err := conn.Consume(ctx, cfg, func(ctx context.Context, d rabbitmq.Delivery) error {
+	order, err := decode(d.Body)
+	if err != nil {
+		return fmt.Errorf("decode: %w", rabbitmq.ErrDeadLetter) // reject, no requeue
+	}
+	if err := store(ctx, order); err != nil {
+		if isTransient(err) {
+			return fmt.Errorf("store: %w", rabbitmq.ErrRequeue) // nack, requeue
+		}
+		return err // plain error: nack, requeue per RequeueOnError
+	}
+	return nil // ack
+})
+```
+
+| Handler returns | Wire call |
+|---|---|
+| `nil` | `basic.ack` |
+| matches `ErrRequeue` | `basic.nack` requeue=true |
+| matches `ErrDeadLetter` | `basic.reject` requeue=false |
+| other error / panic | `basic.nack` requeue=`RequeueOnError` |
+
+Settlement always goes to the channel that delivered the message. If that channel closed while the handler ran (for example on a reconnect), the delivery is left unsettled and the broker redelivers it, so a handler can see the same message twice. Sentinels are ignored with `AutoAck`.
+
+To drop poison messages for the whole consumer instead of requeuing forever, use `cfg.NoRequeue()` and bind the queue to a dead-letter exchange.
 
 ---
 
@@ -196,6 +232,10 @@ errors.Is(err, rabbitmq.ErrNacked)        // confirms: broker nacked
 errors.Is(err, rabbitmq.ErrConfirmTimeout) // confirms: no answer in time (outcome unknown)
 errors.Is(err, rabbitmq.ErrConfirmLost)   // confirms: channel dropped, retries spent (outcome unknown)
 errors.Is(err, rabbitmq.ErrInvalidQueue)  // bad queue shape (e.g. exclusive quorum queue)
+
+// returned by a Handler to pick the settlement of one message
+return fmt.Errorf("...: %w", rabbitmq.ErrRequeue)    // nack, requeue
+return fmt.Errorf("...: %w", rabbitmq.ErrDeadLetter) // reject, dead-letter
 ```
 
 ---

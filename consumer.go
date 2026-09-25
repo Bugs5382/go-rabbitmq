@@ -25,6 +25,7 @@ OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -32,9 +33,9 @@ import (
 )
 
 // Delivery is a received message handed to a Handler. It is a value copy of the
-// useful fields of an amqp091 delivery; acknowledgement is handled by the
-// consumer based on the Handler's returned error, so the Handler never acks
-// directly.
+// useful fields of an amqp091 delivery; settlement (ack, nack or reject) is
+// handled by the consumer based on the Handler's returned error, so the Handler
+// never acks directly.
 type Delivery struct {
 	Body            []byte
 	RoutingKey      string
@@ -73,10 +74,20 @@ func toDelivery(d amqp.Delivery) Delivery {
 	}
 }
 
-// Handler processes a single Delivery. Returning nil acknowledges the message;
-// returning an error negatively acknowledges it (requeued or dropped per
-// ConsumerConfig.RequeueOnError). A panic in a Handler is recovered and treated
-// as an error.
+// Handler processes a single Delivery. Its returned error decides how the
+// message is settled:
+//
+//   - nil: ack.
+//   - an error matching ErrDeadLetter: reject without requeue, so the broker
+//     dead-letters it (or drops it if the queue has no dead-letter exchange).
+//   - an error matching ErrRequeue: nack with requeue.
+//   - any other error: nack, requeued or not per ConsumerConfig.RequeueOnError.
+//
+// Matching uses errors.Is, so the sentinels can be wrapped with context:
+// fmt.Errorf("decode: %w", rabbitmq.ErrDeadLetter). ErrDeadLetter wins when an
+// error matches both. A panic in a Handler is recovered and treated as a plain
+// error. With AutoAck the broker has already settled the message and the error
+// is only logged.
 type Handler func(ctx context.Context, d Delivery) error
 
 // ConsumerConfig describes what and how to consume. Its Exchange, Queue and
@@ -97,8 +108,9 @@ type ConsumerConfig struct {
 	// AutoAck disables manual acknowledgement. Leave false (the default) for
 	// at-least-once delivery driven by the Handler's error.
 	AutoAck bool
-	// RequeueOnError controls whether a Handler error requeues the message
-	// (default true) or drops/dead-letters it (false).
+	// RequeueOnError controls whether a plain Handler error requeues the message
+	// (default true) or drops/dead-letters it (false). ErrRequeue and
+	// ErrDeadLetter override it for a single message.
 	RequeueOnError bool
 	// Exclusive requests exclusive consumer access to the queue.
 	Exclusive bool
@@ -252,9 +264,10 @@ func (c *Conn) dispatch(
 	}
 }
 
-// handleDelivery invokes the handler (recovering panics) and acks or nacks
-// accordingly. When AutoAck is set the broker has already acked, so it only
-// invokes the handler and reports to the observer.
+// handleDelivery invokes the handler (recovering panics) and settles the
+// delivery on the channel it arrived on, as the handler's error directs. When
+// AutoAck is set the broker has already acked, so it only invokes the handler
+// and reports to the observer.
 func (c *Conn) handleDelivery(
 	ctx context.Context,
 	ch wireChannel,
@@ -275,15 +288,32 @@ func (c *Conn) handleDelivery(
 		return
 	}
 
-	if herr == nil {
-		if err := ch.Ack(d.DeliveryTag, false); err != nil {
-			c.log.Warnf("rabbitmq: ack failed on %q: %v", queueName, err)
-		}
+	// A delivery tag only means something on the channel that issued it. If that
+	// channel closed while the handler ran, the broker has already returned the
+	// message to the queue and will redeliver it; settling now would at best
+	// fail and at worst hit an unrelated delivery.
+	if ch.IsClosed() {
+		c.log.Warnf("rabbitmq: channel for %q closed during handling; delivery %d not settled, the broker will redeliver it",
+			queueName, d.DeliveryTag)
 		return
 	}
-	c.log.Warnf("rabbitmq: handler error on %q (requeue=%t): %v", queueName, cfg.RequeueOnError, herr)
-	if err := ch.Nack(d.DeliveryTag, false, cfg.RequeueOnError); err != nil {
-		c.log.Warnf("rabbitmq: nack failed on %q: %v", queueName, err)
+
+	var err error
+	switch {
+	case herr == nil:
+		err = ch.Ack(d.DeliveryTag, false)
+	case errors.Is(herr, ErrDeadLetter):
+		c.log.Warnf("rabbitmq: handler dead-lettered a message on %q: %v", queueName, herr)
+		err = ch.Reject(d.DeliveryTag, false)
+	case errors.Is(herr, ErrRequeue):
+		c.log.Warnf("rabbitmq: handler requeued a message on %q: %v", queueName, herr)
+		err = ch.Nack(d.DeliveryTag, false, true)
+	default:
+		c.log.Warnf("rabbitmq: handler error on %q (requeue=%t): %v", queueName, cfg.RequeueOnError, herr)
+		err = ch.Nack(d.DeliveryTag, false, cfg.RequeueOnError)
+	}
+	if err != nil {
+		c.log.Warnf("rabbitmq: settling delivery %d on %q failed: %v", d.DeliveryTag, queueName, err)
 	}
 }
 

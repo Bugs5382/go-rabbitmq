@@ -193,6 +193,7 @@ type fakeChannel struct {
 	pubKeys   []string
 	acked     []uint64
 	nacked    []nackRecord
+	rejected  []rejectRecord
 	qos       *qosArgs
 
 	publishErr   error
@@ -274,6 +275,11 @@ type qosArgs struct {
 type nackRecord struct {
 	tag               uint64
 	multiple, requeue bool
+}
+
+type rejectRecord struct {
+	tag     uint64
+	requeue bool
 }
 
 func (ch *fakeChannel) ExchangeDeclare(name, kind string, durable, autoDelete, internal, noWait bool, args amqp.Table) error {
@@ -416,6 +422,15 @@ func (ch *fakeChannel) Nack(tag uint64, multiple, requeue bool) error {
 	return nil
 }
 
+// Reject records the call even on a closed channel, as Ack and Nack do, so a
+// test can detect a settlement attempted on a dead channel.
+func (ch *fakeChannel) Reject(tag uint64, requeue bool) error {
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
+	ch.rejected = append(ch.rejected, rejectRecord{tag, requeue})
+	return nil
+}
+
 func (ch *fakeChannel) NotifyClose(receiver chan *amqp.Error) chan *amqp.Error {
 	ch.mu.Lock()
 	defer ch.mu.Unlock()
@@ -519,4 +534,17 @@ func (ch *fakeChannel) pendingConfirms() int {
 	ch.mu.Lock()
 	defer ch.mu.Unlock()
 	return len(ch.pending)
+}
+
+func (ch *fakeChannel) rejectRecords() []rejectRecord {
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
+	return append([]rejectRecord(nil), ch.rejected...)
+}
+
+// settleCount is the number of Ack, Nack and Reject calls made on the channel.
+func (ch *fakeChannel) settleCount() int {
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
+	return len(ch.acked) + len(ch.nacked) + len(ch.rejected)
 }

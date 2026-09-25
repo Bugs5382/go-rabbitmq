@@ -22,8 +22,8 @@
 //     outbox worker can simply try again later. WithConfirms makes Publish wait
 //     for the broker's publisher confirm, for at-least-once delivery.
 //   - Consume runs a consumer that re-declares its queue and bindings and resumes
-//     after any reconnect, with manual acknowledgement driven by the handler's
-//     returned error.
+//     after any reconnect, with manual settlement (ack, requeue or dead-letter)
+//     driven by the handler's returned error.
 //   - The topology helpers (DeclareExchange, DeclareQueue, BindQueue,
 //     DeclareTopology) declare exchanges, queues and bindings idempotently and
 //     guard the quorum-vs-classic queue rules.
