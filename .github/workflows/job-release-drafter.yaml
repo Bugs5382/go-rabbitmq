@@ -29,12 +29,13 @@ permissions:
 
 jobs:
   update_release_draft:
-    name: Update Release Draft
+    name: 📝 Update Release Draft
     permissions:
       contents: write
       pull-requests: read
     runs-on: ubuntu-latest
     steps:
-      - uses: release-drafter/release-drafter@v6
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Draft release notes
+        uses: release-drafter/release-drafter@v7
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
