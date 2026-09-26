@@ -134,8 +134,9 @@ conn, _ := rabbitmq.Connect(ctx, url, rmqotel.Instrument()...)
 ## 🛠 Develop
 
 ```bash
-task ci        # build + vet + lint + test
-task license   # inject MIT headers (golic)
+task lint          # tests, license check, gofmt, golangci-lint, yamllint, gitleaks
+task license       # check MIT headers (golic, never writes)
+task license:fix   # inject missing MIT headers
 ```
 
 ## ⚖️ License
