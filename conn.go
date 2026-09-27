@@ -25,6 +25,8 @@ OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -53,6 +55,12 @@ type Conn struct {
 	ready      chan struct{} // closed while a live connection is available
 	closed     bool
 	reconnects atomic.Uint64
+
+	// abandoned is closed, and abandonErr set, once the background reconnect
+	// gives up (Backoff.MaxRetries spent), so waiters fail instead of blocking
+	// forever (issue #20).
+	abandoned  chan struct{}
+	abandonErr error
 }
 
 // Connect establishes the initial connection and starts the background monitor.
@@ -69,12 +77,13 @@ func Connect(ctx context.Context, url string, opts ...Option) (*Conn, error) {
 
 	mctx, cancel := context.WithCancel(context.Background())
 	c := &Conn{
-		url:    url,
-		opts:   o,
-		log:    o.logger,
-		ctx:    mctx,
-		cancel: cancel,
-		ready:  make(chan struct{}),
+		url:       url,
+		opts:      o,
+		log:       o.logger,
+		ctx:       mctx,
+		cancel:    cancel,
+		ready:     make(chan struct{}),
+		abandoned: make(chan struct{}),
 	}
 
 	conn, err := c.dialWithRetry(ctx)
@@ -143,7 +152,11 @@ func (c *Conn) monitor(conn wireConn) {
 
 		next, err := c.dialWithRetry(c.ctx)
 		if err != nil {
+			if c.isClosed() || errors.Is(err, ErrClosed) {
+				return
+			}
 			c.log.Errorf("rabbitmq: reconnect abandoned: %v", err)
+			c.abandon(err)
 			return
 		}
 		c.reconnects.Add(1)
@@ -152,6 +165,22 @@ func (c *Conn) monitor(conn wireConn) {
 		c.log.Infof("rabbitmq: reconnected to %s (reconnect #%d)", safeURL(c.url), c.reconnects.Load())
 		closeCh = next.NotifyClose(make(chan *amqp.Error, 1))
 	}
+}
+
+// abandon records that the background reconnect gave up and wakes every
+// waiter, which then fails with ErrReconnectAbandoned.
+func (c *Conn) abandon(err error) {
+	c.mu.Lock()
+	c.abandonErr = err
+	c.mu.Unlock()
+	close(c.abandoned)
+}
+
+// abandonedErr returns the error for a call made after the reconnect gave up.
+func (c *Conn) abandonedErr() error {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return fmt.Errorf("%w: %w: %v", ErrNotReady, ErrReconnectAbandoned, c.abandonErr)
 }
 
 // setConn installs a live connection and signals readiness.
@@ -200,10 +229,17 @@ func (c *Conn) waitReady(ctx context.Context) (wireConn, error) {
 			return conn, nil
 		}
 		select {
+		case <-c.abandoned:
+			return nil, c.abandonedErr()
+		default:
+		}
+		select {
 		case <-ctx.Done():
 			return nil, ErrNotReady
 		case <-c.ctx.Done():
 			return nil, ErrClosed
+		case <-c.abandoned:
+			return nil, c.abandonedErr()
 		case <-ready:
 			// readiness signalled; re-read the connection on the next iteration.
 		}

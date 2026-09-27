@@ -116,6 +116,14 @@ type ConsumerConfig struct {
 	Exclusive bool
 	// Args are passed to the underlying Consume call.
 	Args amqp.Table
+	// StreamOffset is where a consumer of a QueueStream queue starts reading
+	// (x-stream-offset): StreamOffsetFirst, StreamOffsetLast, StreamOffsetNext,
+	// StreamOffsetAt or StreamOffsetTime. The zero value sends no offset and
+	// the broker default (next) applies. It overrides x-stream-offset in Args.
+	// It only applies to the first session: after a drop the consumer resumes
+	// just after the last offset its handler saw. Setting it on a queue that is
+	// not a stream is an ErrInvalidConsumer.
+	StreamOffset StreamOffset
 	// OnStatus, if set, is called with each new ConsumerStatus: starting,
 	// consuming, every retry (with the error, attempt and backoff), and stopped.
 	// It runs on the consumer's goroutine, so it must return quickly and must not
@@ -168,7 +176,10 @@ func (c *Conn) Consume(ctx context.Context, cfg ConsumerConfig, handler Handler)
 // the channel or connection drops (returns nil for a clean drop) or a setup step
 // fails (returns the error). onConsuming is called with the resolved queue name
 // once the broker has accepted the consume, before the first delivery.
-func (c *Conn) consumeSession(ctx context.Context, cfg ConsumerConfig, handler Handler, onConsuming func(queue string)) error {
+//
+// For a stream queue, cursor supplies the offset to start at and records the
+// offset of each handled delivery.
+func (c *Conn) consumeSession(ctx context.Context, cfg ConsumerConfig, handler Handler, cursor *streamCursor, onConsuming func(queue string)) error {
 	ch, err := c.openChannel(ctx)
 	if err != nil {
 		return err
@@ -184,7 +195,15 @@ func (c *Conn) consumeSession(ctx context.Context, cfg ConsumerConfig, handler H
 		return fmt.Errorf("set qos: %w", err)
 	}
 
-	deliveries, err := ch.Consume(queueName, cfg.ConsumerTag, cfg.AutoAck, cfg.Exclusive, false, false, cfg.Args)
+	offset := cursor.resume(cfg.StreamOffset)
+	args, err := cfg.consumeArgs(offset)
+	if err != nil {
+		return err
+	}
+	if cfg.Queue.Type == QueueStream {
+		c.log.Debugf("rabbitmq: consuming stream %q from %s", queueName, offset)
+	}
+	deliveries, err := ch.Consume(queueName, cfg.ConsumerTag, cfg.AutoAck, cfg.Exclusive, false, false, args)
 	if err != nil {
 		return fmt.Errorf("consume %q: %w", queueName, err)
 	}
@@ -192,7 +211,7 @@ func (c *Conn) consumeSession(ctx context.Context, cfg ConsumerConfig, handler H
 	c.log.Infof("rabbitmq: consuming from %q (prefetch %d)", queueName, cfg.Prefetch)
 	onConsuming(queueName)
 
-	return c.dispatch(ctx, ch, cfg, queueName, handler, deliveries, closeCh)
+	return c.dispatch(ctx, ch, cfg, queueName, handler, cursor, deliveries, closeCh)
 }
 
 // setupConsumer declares the exchange, queue and bindings for a consumer and
@@ -228,6 +247,7 @@ func (c *Conn) dispatch(
 	cfg ConsumerConfig,
 	queueName string,
 	handler Handler,
+	cursor *streamCursor,
 	deliveries <-chan amqp.Delivery,
 	closeCh <-chan *amqp.Error,
 ) error {
@@ -247,6 +267,11 @@ func (c *Conn) dispatch(
 				return nil // delivery stream ended; caller re-establishes.
 			}
 			c.handleDelivery(ctx, ch, cfg, queueName, handler, d)
+			if cfg.Queue.Type == QueueStream {
+				if off, ok := cursor.record(d.Headers); ok {
+					c.log.Debugf("rabbitmq: stream %q handled offset %d", queueName, off)
+				}
+			}
 		}
 	}
 }

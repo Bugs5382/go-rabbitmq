@@ -23,7 +23,10 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 */
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+)
 
 var (
 	// ErrClosed is returned by operations on a Conn after Close has been called.
@@ -78,4 +81,49 @@ var (
 	// ErrConsumerRunning is returned by Consumer.Run when the same Consumer is
 	// already running. A Consumer can be run again once Run has returned.
 	ErrConsumerRunning = errors.New("rabbitmq: consumer is already running")
+
+	// ErrInvalidConsumer is returned by Consumer.Run (and Conn.Consume) when a
+	// ConsumerConfig can never work, for example AutoAck on a stream queue, a
+	// StreamOffset on a queue that is not a stream, or a negative offset. Run
+	// returns it at once, before touching the broker, instead of retrying.
+	ErrInvalidConsumer = errors.New("rabbitmq: invalid consumer configuration")
+
+	// ErrUnroutable is matched (with ErrPublishFailed) by the error Publish
+	// returns when a publisher created WithMandatory has its message returned by
+	// the broker because no queue was bound to receive it. The error is an
+	// *UnroutableError carrying the broker's reply code and text. It is not
+	// retried inside Publish: the message went nowhere, and it will keep going
+	// nowhere until a binding exists.
+	ErrUnroutable = errors.New("rabbitmq: message was returned as unroutable")
+
+	// ErrReconnectAbandoned is matched (with ErrNotReady) by the error of any
+	// call that needs a connection after the background reconnect gave up
+	// because Backoff.MaxRetries was spent. The Conn stays unusable; close it
+	// and connect again. With the default MaxRetries of 0 the Conn never gives
+	// up, so this is never returned.
+	ErrReconnectAbandoned = errors.New("rabbitmq: reconnect abandoned after MaxRetries")
 )
+
+// UnroutableError describes a mandatory publish the broker returned. It matches
+// ErrUnroutable with errors.Is; use errors.As to read the details.
+type UnroutableError struct {
+	// ReplyCode is the AMQP reply code of the basic.return, 312 (NO_ROUTE) when
+	// no binding matched.
+	ReplyCode uint16
+	// ReplyText is the broker's reason, for example "NO_ROUTE".
+	ReplyText string
+	// Exchange and RoutingKey are where the message was published.
+	Exchange   string
+	RoutingKey string
+	// MessageID is the message id of the returned message, if it had one.
+	MessageID string
+}
+
+// Error describes the return.
+func (e *UnroutableError) Error() string {
+	return fmt.Sprintf("rabbitmq: message to exchange %q with routing key %q was returned: %d %s",
+		e.Exchange, e.RoutingKey, e.ReplyCode, e.ReplyText)
+}
+
+// Is reports whether target is ErrUnroutable.
+func (e *UnroutableError) Is(target error) bool { return target == ErrUnroutable }

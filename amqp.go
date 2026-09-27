@@ -58,6 +58,9 @@ type wireChannel interface {
 	Nack(tag uint64, multiple, requeue bool) error
 	Reject(tag uint64, requeue bool) error
 	NotifyClose(receiver chan *amqp.Error) chan *amqp.Error
+	// NotifyReturn registers a basic.return listener; amqp091 closes it when
+	// the channel closes.
+	NotifyReturn(receiver chan amqp.Return) chan amqp.Return
 	Close() error
 	IsClosed() bool
 
