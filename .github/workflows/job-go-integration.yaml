@@ -27,9 +27,7 @@ name: Integration
 on:
   pull_request:
     branches: [main]
-  push:
-    branches: [main]
-    paths-ignore: ['**.md']
+    types: [opened, synchronize, reopened, ready_for_review]
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
@@ -38,6 +36,7 @@ permissions:
 jobs:
   integration:
     name: 🐇 Integration (RabbitMQ)
+    if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     timeout-minutes: 15
     services:
