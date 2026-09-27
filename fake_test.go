@@ -203,6 +203,14 @@ type fakeChannel struct {
 	bindErr      error // fails QueueBind only
 	deliveries   chan amqp.Delivery
 	consumeCount int
+	consumeArgs  []amqp.Table // args of each Consume call
+	autoAcks     []bool       // autoAck of each Consume call
+
+	// mandatory publishes and returns
+	pubMandatory  []bool
+	returnNotify  []chan amqp.Return
+	returnPayload amqp.Return     // template for scripted returns (reply code/text)
+	returnKeys    map[string]bool // routing keys the broker returns (then acks)
 
 	// confirm mode
 	confirmMode  bool
@@ -216,10 +224,11 @@ type fakeChannel struct {
 type confirmOutcome int
 
 const (
-	confirmAck   confirmOutcome = iota // broker acks
-	confirmNack                        // broker nacks
-	confirmNever                       // no answer until the channel closes
-	confirmDrop                        // the channel closes before the answer arrives
+	confirmAck    confirmOutcome = iota // broker acks
+	confirmNack                         // broker nacks
+	confirmNever                        // no answer until the channel closes
+	confirmDrop                         // the channel closes before the answer arrives
+	confirmReturn                       // the broker returns the message, then acks it
 )
 
 // fakeConfirm implements confirmation.
@@ -358,12 +367,13 @@ func (ch *fakeChannel) Confirm(_ bool) error {
 	return nil
 }
 
-func (ch *fakeChannel) publishDeferred(_ context.Context, exchange, key string, _, _ bool, msg amqp.Publishing) (confirmation, error) {
+func (ch *fakeChannel) publishDeferred(_ context.Context, exchange, key string, mandatory, _ bool, msg amqp.Publishing) (confirmation, error) {
 	ch.mu.Lock()
 	if err := ch.recordPublishLocked(exchange, key, msg); err != nil {
 		ch.mu.Unlock()
 		return nil, err
 	}
+	ch.pubMandatory = append(ch.pubMandatory, mandatory)
 	if !ch.confirmMode {
 		ch.mu.Unlock()
 		return nil, nil
@@ -373,8 +383,26 @@ func (ch *fakeChannel) publishDeferred(_ context.Context, exchange, key string, 
 		outcome = ch.confirmPlan[0]
 		ch.confirmPlan = ch.confirmPlan[1:]
 	}
+	if ch.returnKeys[key] {
+		outcome = confirmReturn
+	}
+	if outcome == confirmReturn && !mandatory {
+		outcome = confirmAck // the broker drops an unroutable non-mandatory message and acks it
+	}
 	c := newFakeConfirm()
 	switch outcome {
+	case confirmReturn:
+		// Like RabbitMQ, the basic.return reaches the listeners before the ack.
+		ret := ch.returnPayload
+		if ret.ReplyCode == 0 {
+			ret.ReplyCode, ret.ReplyText = amqp.NoRoute, "NO_ROUTE"
+		}
+		ret.Exchange, ret.RoutingKey = exchange, key
+		ret.Headers, ret.MessageId, ret.Body = msg.Headers, msg.MessageId, msg.Body
+		for _, l := range ch.returnNotify {
+			l <- ret
+		}
+		c.resolve(true)
 	case confirmAck:
 		c.resolve(true)
 	case confirmNack:
@@ -395,10 +423,12 @@ func (ch *fakeChannel) IsClosed() bool {
 	return ch.closed
 }
 
-func (ch *fakeChannel) Consume(_, _ string, _, _, _, _ bool, _ amqp.Table) (<-chan amqp.Delivery, error) {
+func (ch *fakeChannel) Consume(_, _ string, autoAck, _, _, _ bool, args amqp.Table) (<-chan amqp.Delivery, error) {
 	ch.mu.Lock()
 	defer ch.mu.Unlock()
 	ch.consumeCount++
+	ch.consumeArgs = append(ch.consumeArgs, args)
+	ch.autoAcks = append(ch.autoAcks, autoAck)
 	if ch.consumeErr != nil {
 		return nil, ch.consumeErr
 	}
@@ -446,6 +476,19 @@ func (ch *fakeChannel) NotifyClose(receiver chan *amqp.Error) chan *amqp.Error {
 	return receiver
 }
 
+// NotifyReturn registers a basic.return listener. Like amqp091, the listener is
+// closed when the channel closes.
+func (ch *fakeChannel) NotifyReturn(receiver chan amqp.Return) chan amqp.Return {
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
+	if ch.closed {
+		close(receiver)
+		return receiver
+	}
+	ch.returnNotify = append(ch.returnNotify, receiver)
+	return receiver
+}
+
 func (ch *fakeChannel) Close() error {
 	ch.mu.Lock()
 	if ch.closed {
@@ -455,6 +498,8 @@ func (ch *fakeChannel) Close() error {
 	ch.closed = true
 	listeners := ch.closeNotify
 	ch.closeNotify = nil
+	returnListeners := ch.returnNotify
+	ch.returnNotify = nil
 	pending := ch.pending
 	ch.pending = nil
 	ch.mu.Unlock()
@@ -464,6 +509,9 @@ func (ch *fakeChannel) Close() error {
 		c.resolve(false)
 	}
 	for _, l := range listeners {
+		close(l)
+	}
+	for _, l := range returnListeners {
 		close(l)
 	}
 	return nil
@@ -551,4 +599,35 @@ func (ch *fakeChannel) settleCount() int {
 	ch.mu.Lock()
 	defer ch.mu.Unlock()
 	return len(ch.acked) + len(ch.nacked) + len(ch.rejected)
+}
+
+// lastConsumeArgs returns the args of the most recent Consume call.
+func (ch *fakeChannel) lastConsumeArgs() amqp.Table {
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
+	if len(ch.consumeArgs) == 0 {
+		return nil
+	}
+	return ch.consumeArgs[len(ch.consumeArgs)-1]
+}
+
+// mandatoryFlags returns the mandatory flag of each confirmed publish.
+func (ch *fakeChannel) mandatoryFlags() []bool {
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
+	return append([]bool(nil), ch.pubMandatory...)
+}
+
+// returnListeners reports how many basic.return listeners are registered.
+func (ch *fakeChannel) returnListeners() int {
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
+	return len(ch.returnNotify)
+}
+
+// publishedAt returns a copy of the i-th published message.
+func (ch *fakeChannel) publishedAt(i int) amqp.Publishing {
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
+	return ch.published[i]
 }

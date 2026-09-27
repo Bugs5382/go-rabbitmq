@@ -103,6 +103,8 @@ type Consumer struct {
 	cfg     ConsumerConfig
 	handler Handler
 	running atomic.Bool
+	// cursor tracks the last handled stream offset across sessions (issue #19).
+	cursor streamCursor
 
 	mu     sync.RWMutex
 	status ConsumerStatus
@@ -191,13 +193,20 @@ func (cons *Consumer) Run(ctx context.Context) error {
 		return err
 	}
 
+	// A stream config that can never work is final: report it instead of
+	// retrying it forever (issue #19).
+	if err := cfg.validateStream(); err != nil {
+		log.Errorf("rabbitmq: consumer on %q rejected before consuming: %v", cfg.Queue.Name, err)
+		return stop(err)
+	}
+
 	attempt := 0
 	for {
 		if err := ctx.Err(); err != nil {
 			return stop(err)
 		}
 		consumed := false
-		err := c.consumeSession(ctx, cfg, cons.handler, func(queue string) {
+		err := c.consumeSession(ctx, cfg, cons.handler, &cons.cursor, func(queue string) {
 			consumed = true
 			attempt = 0
 			cons.setStatus(ConsumerStatus{State: ConsumerConsuming, Queue: queue})

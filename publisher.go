@@ -47,6 +47,7 @@ type publisherOptions struct {
 	maxRetries     int
 	confirms       bool
 	confirmTimeout time.Duration
+	returns        bool // WithMandatory: mandatory + confirms + return tracking
 }
 
 // PublisherOption configures a Publisher at construction time.
@@ -73,6 +74,10 @@ func WithPersistentDefault(persistent bool) PublisherOption {
 
 // WithMandatoryDefault sets the default for the AMQP mandatory flag. The default
 // is false.
+//
+// It only sets the flag: nothing listens for the broker's basic.return, so an
+// unroutable message is still dropped and Publish still returns nil. Use
+// WithMandatory to have unroutable messages reported as ErrUnroutable.
 func WithMandatoryDefault(mandatory bool) PublisherOption {
 	return func(o *publisherOptions) { o.mandatory = mandatory }
 }
@@ -109,6 +114,32 @@ func WithConfirms() PublisherOption {
 	return func(o *publisherOptions) { o.confirms = true }
 }
 
+// WithMandatory makes the publisher report messages the broker cannot route
+// (issue #20). Every message is published with the AMQP mandatory flag, the
+// channel is put in publisher-confirm mode (as WithConfirms does), and each
+// channel the publisher opens listens for basic.return. Publish waits for the
+// broker's answer:
+//
+//   - routed and acked: Publish returns nil.
+//   - returned, because no queue is bound to receive it: Publish returns an
+//     *UnroutableError that matches ErrUnroutable and ErrPublishFailed. It is
+//     not retried; the message was not stored anywhere.
+//   - nack, confirm timeout, or a channel or connection drop: as for
+//     WithConfirms. A publish in flight during a reconnect is re-published on a
+//     fresh channel within WithPublishRetries, and its return (if any) is
+//     reported from that channel; otherwise it fails with ErrConfirmLost. It
+//     never waits past the confirm timeout or the Publish ctx.
+//
+// To match a return to its publish, each message carries a PublishIDHeader
+// header with a unique id. The caller's header table is copied, not modified.
+// WithMandatoryDefault(false) does not switch the flag off again.
+func WithMandatory() PublisherOption {
+	return func(o *publisherOptions) {
+		o.returns = true
+		o.confirms = true
+	}
+}
+
 // WithConfirmTimeout bounds how long each publish attempt waits for its broker
 // confirm when WithConfirms is set. The default is DefaultConfirmTimeout. A value
 // <=0 removes the bound, so only the Publish ctx limits the wait.
@@ -124,8 +155,11 @@ type Publisher struct {
 	exchange string
 	opts     publisherOptions
 
-	mu sync.Mutex
-	ch wireChannel
+	ids *publishIDs // PublishIDHeader values, when WithMandatory is set
+
+	mu      sync.Mutex
+	ch      wireChannel
+	tracker *returnTracker // basic.return collector for ch, when WithMandatory is set
 }
 
 // NewPublisher creates a Publisher for the given exchange. An empty exchange name
@@ -141,7 +175,13 @@ func (c *Conn) NewPublisher(exchange string, opts ...PublisherOption) *Publisher
 	for _, opt := range opts {
 		opt(&o)
 	}
-	return &Publisher{conn: c, exchange: exchange, opts: o}
+	p := &Publisher{conn: c, exchange: exchange, opts: o}
+	if o.returns {
+		p.ids = newPublishIDs()
+	}
+	c.log.Debugf("rabbitmq: publisher for exchange %q created (confirms %t, mandatory returns %t, retries %d)",
+		exchange, o.confirms, o.returns, o.maxRetries)
+	return p
 }
 
 // PublishOption customises a single Publish call.
@@ -205,31 +245,38 @@ func WithAppID(id string) PublishOption {
 }
 
 // channel returns a live channel, opening (and re-declaring, if configured) a new
-// one when necessary.
-func (p *Publisher) channel(ctx context.Context) (wireChannel, error) {
+// one when necessary. With WithMandatory it also returns the channel's return
+// tracker.
+func (p *Publisher) channel(ctx context.Context) (wireChannel, *returnTracker, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.ch != nil {
-		return p.ch, nil
+		return p.ch, p.tracker, nil
 	}
 	ch, err := p.conn.openChannel(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if p.opts.confirms {
 		if err := ch.Confirm(false); err != nil {
 			_ = ch.Close()
-			return nil, fmt.Errorf("enable publisher confirms: %w", err)
+			return nil, nil, fmt.Errorf("enable publisher confirms: %w", err)
 		}
 	}
 	if p.opts.declare != nil {
 		if err := declareExchangeOn(ch, *p.opts.declare); err != nil {
 			_ = ch.Close()
-			return nil, fmt.Errorf("declare exchange %q: %w", p.exchange, err)
+			return nil, nil, fmt.Errorf("declare exchange %q: %w", p.exchange, err)
 		}
 	}
-	p.ch = ch
-	return ch, nil
+	var tracker *returnTracker
+	if p.opts.returns {
+		tracker = newReturnTracker(ch, p.conn.log)
+	}
+	p.conn.log.Debugf("rabbitmq: publisher for %q opened a channel (confirms %t, return listener %t)",
+		p.exchange, p.opts.confirms, tracker != nil)
+	p.ch, p.tracker = ch, tracker
+	return ch, tracker, nil
 }
 
 // resetChannel drops the cached channel so the next publish opens a fresh one.
@@ -237,14 +284,17 @@ func (p *Publisher) channel(ctx context.Context) (wireChannel, error) {
 // channel, so a concurrent publish that already opened a replacement keeps it.
 func (p *Publisher) resetChannel(failed wireChannel) {
 	p.mu.Lock()
-	ch := p.ch
+	ch, tracker := p.ch, p.tracker
 	if failed != nil && ch != failed {
 		p.mu.Unlock()
 		_ = failed.Close()
 		return
 	}
-	p.ch = nil
+	p.ch, p.tracker = nil, nil
 	p.mu.Unlock()
+	if tracker != nil {
+		tracker.stop()
+	}
 	if ch != nil {
 		_ = ch.Close()
 	}
@@ -307,12 +357,17 @@ func (p *Publisher) publishWithRetry(ctx context.Context, exchange, routingKey s
 			case <-time.After(backoff.delay(attempt - 1)):
 			}
 		}
-		ch, err := p.channel(ctx)
+		ch, tracker, err := p.channel(ctx)
 		if err != nil {
 			lastErr = err
+			p.conn.log.Warnf("rabbitmq: publish to %q/%q could not get a channel (attempt %d): %v",
+				exchange, routingKey, attempt+1, err)
+			if errors.Is(err, ErrClosed) || errors.Is(err, ErrReconnectAbandoned) {
+				break // no connection will come back; retrying cannot help.
+			}
 			continue
 		}
-		retry, err := p.send(ctx, ch, exchange, routingKey, msg)
+		retry, err := p.send(ctx, ch, tracker, exchange, routingKey, msg)
 		p.conn.opts.observer.OnPublish(exchange, routingKey, err)
 		if err == nil {
 			return nil
@@ -331,11 +386,21 @@ func (p *Publisher) publishWithRetry(ctx context.Context, exchange, routingKey s
 // send performs one publish attempt on ch and, in confirm mode, waits for the
 // broker's answer. retry reports whether a failure should be retried on a fresh
 // channel.
-func (p *Publisher) send(ctx context.Context, ch wireChannel, exchange, routingKey string, msg *amqp.Publishing) (retry bool, err error) {
+//
+// With WithMandatory the message is sent with the mandatory flag and a fresh
+// PublishIDHeader, and an ack is checked against the channel's returns.
+func (p *Publisher) send(ctx context.Context, ch wireChannel, tracker *returnTracker, exchange, routingKey string, msg *amqp.Publishing) (retry bool, err error) {
 	if !p.opts.confirms {
 		return true, ch.PublishWithContext(ctx, exchange, routingKey, p.opts.mandatory, false, *msg)
 	}
-	conf, err := ch.publishDeferred(ctx, exchange, routingKey, p.opts.mandatory, false, *msg)
+	out, mandatory, id := *msg, p.opts.mandatory, ""
+	if tracker != nil {
+		id = p.ids.next()
+		out, mandatory = withPublishID(out, id), true
+		p.conn.log.Debugf("rabbitmq: mandatory publish %s to %q/%q", id, exchange, routingKey)
+	}
+	start := time.Now()
+	conf, err := ch.publishDeferred(ctx, exchange, routingKey, mandatory, false, out)
 	if err != nil {
 		return true, err
 	}
@@ -352,6 +417,16 @@ func (p *Publisher) send(ctx context.Context, ch wireChannel, exchange, routingK
 		defer cancel()
 	}
 	acked, err := conf.WaitContext(waitCtx)
+	if tracker != nil {
+		// Claim the return whatever the outcome, so it is not held on to.
+		if ret, returned := tracker.take(id); returned && err == nil && acked {
+			p.conn.log.Warnf("rabbitmq: publish %s to %q/%q was returned unroutable after %s: %d %s",
+				id, exchange, routingKey, time.Since(start), ret.ReplyCode, ret.ReplyText)
+			return false, unroutable(ret)
+		}
+		p.conn.log.Debugf("rabbitmq: mandatory publish %s answered after %s (acked %t, err %v)",
+			id, time.Since(start), acked, err)
+	}
 	switch {
 	case err != nil && ctx.Err() != nil:
 		return false, ctx.Err()

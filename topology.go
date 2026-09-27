@@ -48,6 +48,14 @@ const (
 	// QueueQuorum is a replicated, Raft-based durable queue. It must be durable
 	// and named, and may not be exclusive or auto-delete.
 	QueueQuorum QueueType = "quorum"
+	// QueueStream is an append-only, replicated log (issue #19). Consuming does
+	// not remove messages: each consumer picks where it starts reading with
+	// ConsumerConfig.StreamOffset, and retention (QueueConfig.Stream) decides
+	// when old data is dropped. Like a quorum queue it must be durable and named,
+	// and may not be exclusive or auto-delete; a stream consumer must use manual
+	// acknowledgement (AutoAck false). The declare always carries
+	// x-queue-type=stream.
+	QueueStream QueueType = "stream"
 )
 
 // ExchangeConfig describes an exchange to declare. The zero value declares a
@@ -82,14 +90,19 @@ func (e ExchangeConfig) normalize() ExchangeConfig {
 // classic queue.
 type QueueConfig struct {
 	Name       string
-	Type       QueueType // QueueClassic (default) or QueueQuorum
+	Type       QueueType // QueueClassic (default), QueueQuorum or QueueStream
 	Durable    bool      // defaults to true via normalize
 	AutoDelete bool
 	Exclusive  bool
 	NoWait     bool
 	// Args are extra declare arguments. A caller-supplied x-queue-type is kept
-	// for classic queues; for QueueQuorum it is always set to "quorum".
+	// for classic queues; for QueueQuorum and QueueStream it is always set to
+	// the type.
 	Args amqp.Table
+	// Stream holds the retention settings of a QueueStream queue. The zero value
+	// leaves every limit to the broker. Setting it on any other queue type is an
+	// ErrInvalidQueue.
+	Stream StreamOptions
 
 	durableSet bool
 }
@@ -112,7 +125,15 @@ func (q QueueConfig) normalize() QueueConfig {
 // exclusive, auto-delete, or server-named (empty Name); those queue shapes must
 // be classic.
 func (q QueueConfig) validate() error {
-	if q.Type != QueueClassic && q.Type != QueueQuorum {
+	switch q.Type {
+	case QueueClassic, QueueQuorum:
+		if !q.Stream.isZero() {
+			return fmt.Errorf("%w: queue %q has stream retention options but type %q; they need QueueStream",
+				ErrInvalidQueue, q.Name, q.Type)
+		}
+	case QueueStream:
+		return q.validateStream()
+	default:
 		return fmt.Errorf("%w: unknown queue type %q", ErrInvalidQueue, q.Type)
 	}
 	if q.Type == QueueQuorum {
@@ -149,6 +170,8 @@ func (q QueueConfig) classicOnly() bool {
 // PRECONDITION_FAILED. Set Args["x-queue-type"] to pin the type explicitly.
 func (q QueueConfig) args() amqp.Table {
 	switch {
+	case q.Type == QueueStream:
+		return q.streamArgs()
 	case q.Type == QueueQuorum:
 		return withQueueType(q.Args, string(QueueQuorum))
 	case q.classicOnly():
