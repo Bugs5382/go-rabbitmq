@@ -258,3 +258,64 @@ func TestIntegrationStreamRejectsAutoAck(t *testing.T) {
 		t.Fatalf("want ErrInvalidConsumer, got %v", err)
 	}
 }
+
+// TestIntegrationStreamHandlerErrorsDoNotRedeliver checks what the docs say
+// about settlement on a stream: a handler that asks for a requeue or a
+// dead-letter does not get the message again, and the channel stays open.
+func TestIntegrationStreamHandlerErrorsDoNotRedeliver(t *testing.T) {
+	url := brokerURL(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	conn, err := rabbitmq.Connect(ctx, url)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	queue := rabbitmq.QueueConfig{Name: fmt.Sprintf("it.stream.nack.%d", time.Now().UnixNano()), Type: rabbitmq.QueueStream}
+	if _, err := conn.DeclareQueue(ctx, queue); err != nil {
+		t.Fatalf("declare stream: %v", err)
+	}
+	pub := conn.NewPublisher("", rabbitmq.WithConfirms())
+	defer func() { _ = pub.Close() }()
+	for i := 0; i < 6; i++ {
+		if err := pub.Publish(ctx, queue.Name, []byte(fmt.Sprintf("m%d", i))); err != nil {
+			t.Fatalf("publish: %v", err)
+		}
+	}
+
+	got := make(chan string, 64)
+	cctx, ccancel := context.WithCancel(ctx)
+	defer ccancel()
+	n := 0
+	cons := conn.NewConsumer(rabbitmq.ConsumerConfig{Queue: queue, StreamOffset: rabbitmq.StreamOffsetFirst()},
+		func(_ context.Context, d rabbitmq.Delivery) error {
+			got <- string(d.Body)
+			n++
+			if n%2 == 0 {
+				return fmt.Errorf("retry: %w", rabbitmq.ErrRequeue)
+			}
+			return fmt.Errorf("poison: %w", rabbitmq.ErrDeadLetter)
+		})
+	go func() { _ = cons.Run(cctx) }()
+	waitUntil(t, 15*time.Second, "stream consumer ready", cons.Ready)
+
+	for i := 0; i < 6; i++ {
+		select {
+		case body := <-got:
+			if want := fmt.Sprintf("m%d", i); body != want {
+				t.Fatalf("delivery %d = %s, want %s (no redelivery)", i, body, want)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("delivery %d never arrived", i)
+		}
+	}
+	select {
+	case body := <-got:
+		t.Fatalf("unexpected extra delivery %s after nack/reject", body)
+	case <-time.After(2 * time.Second):
+	}
+	if st := cons.Status(); st.State != rabbitmq.ConsumerConsuming || st.Attempt != 0 {
+		t.Errorf("consumer status = %+v, want consuming with no retries", st)
+	}
+}
