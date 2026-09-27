@@ -21,6 +21,9 @@
 //     channel and retries within bounded backoff before returning an error, so an
 //     outbox worker can simply try again later. WithConfirms makes Publish wait
 //     for the broker's publisher confirm, for at-least-once delivery.
+//     WithMandatory adds the mandatory flag on top, so a message no queue is
+//     bound to receive fails with ErrUnroutable instead of being acked and
+//     dropped.
 //   - Consume runs a consumer that re-declares its queue and bindings and resumes
 //     after any reconnect, with manual settlement (ack, requeue or dead-letter)
 //     driven by the handler's returned error. NewConsumer returns the same
@@ -28,7 +31,9 @@
 //     actually consuming, for readiness probes.
 //   - The topology helpers (DeclareExchange, DeclareQueue, BindQueue,
 //     DeclareTopology) declare exchanges, queues and bindings idempotently and
-//     guard the quorum-vs-classic queue rules.
+//     guard the classic, quorum and stream queue rules. A QueueStream queue is
+//     an append-only log with typed retention (StreamOptions); its consumers
+//     pick where they start with ConsumerConfig.StreamOffset.
 //
 // # Pluggable cross-cutting concerns
 //

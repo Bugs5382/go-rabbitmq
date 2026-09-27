@@ -1,6 +1,16 @@
 # go-rabbitmq 🐇
 
-> Pure-Go RabbitMQ with best-practice **auto-reconnecting** connections, publishers, and consumers — so you stop re-solving connection resilience in every service. Optional OpenTelemetry tracing + metrics in one line.
+> 🔁 Pure-Go RabbitMQ with best-practice **auto-reconnecting** connections, publishers, and consumers — so you stop re-solving connection resilience in every service. Optional OpenTelemetry tracing + metrics in one line.
+
+## ✨ Highlights
+
+- 🔌 **Self-healing connection** — one `Conn` re-dials with bounded backoff; publishers and consumers ride through drops.
+- ✅ **Publisher confirms** — `WithConfirms()` returns nil only once the broker has the message.
+- 📭 **Unroutable messages surface** — `WithMandatory()` turns a message no queue receives into `ErrUnroutable` instead of a silent ack.
+- 🎯 **Settlement from your handler** — return nil, `ErrRequeue` or `ErrDeadLetter`; no manual acks.
+- 🌊 **Stream queues** — `QueueStream` with typed retention and a typed start offset (first, last, next, a timestamp or an offset).
+- 🚦 **Consumer readiness** — `Consumer.Ready()` for probes, because a healthy connection is not a working consumer.
+- 🛡️ **Queue shape guards** — quorum and stream rules are checked before the declare, with clear errors.
 
 ## 📦 Install
 
@@ -49,6 +59,32 @@ case errors.Is(err, rabbitmq.ErrConfirmTimeout), errors.Is(err, rabbitmq.ErrConf
 ```
 
 A nack or a confirm timeout (`WithConfirmTimeout`, default 30s) is returned straight away. If the channel or connection drops while a confirm is outstanding, the message is re-published on a fresh channel within the retry budget, and `ErrConfirmLost` is returned once that is spent. A lost confirm is never reported as success. Delivery is at least once, so consumers should de-duplicate.
+
+### Unroutable messages
+
+A confirm only says the broker took the message, not that any queue got it: a message published to an exchange with no matching binding is acked and dropped. `WithMandatory()` closes that gap. It publishes with the AMQP `mandatory` flag, turns on confirms, and listens for the broker's `basic.return`, so `Publish` waits for the confirm or the return:
+
+```go
+pub := conn.NewPublisher("events", rabbitmq.WithMandatory())
+err := pub.Publish(ctx, "order.created", body, rabbitmq.WithMessageID(id))
+
+var unroutable *rabbitmq.UnroutableError
+if errors.As(err, &unroutable) { // also errors.Is(err, rabbitmq.ErrUnroutable)
+	// nothing is bound to receive it: tell the caller it was not accepted
+	log.Printf("returned: %d %s", unroutable.ReplyCode, unroutable.ReplyText) // 312 NO_ROUTE
+}
+```
+
+| Broker answer | `Publish` returns | Retried? |
+|---|---|---|
+| routed, acked | `nil` | — |
+| returned (no binding) | `*UnroutableError`, matches `ErrUnroutable` | no |
+| nack / no answer in time | `ErrNacked` / `ErrConfirmTimeout` | no |
+| channel or connection dropped first | `nil` once a retry is acked, else `ErrConfirmLost` | yes, on a fresh channel |
+
+Every error also matches `ErrPublishFailed`. Returns are matched to their publish through an `x-go-rabbitmq-publish-id` header (`rabbitmq.PublishIDHeader`) the publisher adds to each message, so many publishes can be in flight on one publisher. `WithMandatoryDefault(true)` on its own still only sets the flag and ignores returns, as before.
+
+A publish never hangs across a reconnect: a confirm lost with its channel is retried on the new connection, each attempt is bounded by the confirm timeout, and the whole call by your `ctx`. If the reconnect gives up for good (`Backoff.MaxRetries` spent), waiting calls fail with `ErrReconnectAbandoned` instead of blocking.
 
 ## 📥 Consume
 
@@ -122,6 +158,40 @@ rabbitmq.QueueConfig{Name: "jobs.scratch", AutoDelete: true}
 ```
 
 The library still sends a transient non-exclusive queue as asked, since RabbitMQ 3 accepts it. When a broker refuses it, the declare returns `ErrInvalidQueue` (wrapping the broker's error) with the fix in the message.
+
+## 🌊 Streams
+
+A stream queue is an append-only log: consuming does not remove messages, and each consumer chooses where it starts reading. Retention decides when old data goes.
+
+```go
+stream := rabbitmq.QueueConfig{
+	Name: "orders.log",
+	Type: rabbitmq.QueueStream, // x-queue-type: stream
+	Stream: rabbitmq.StreamOptions{
+		MaxAge:              7 * 24 * time.Hour, // x-max-age "7D"
+		MaxLengthBytes:      10 << 30,           // x-max-length-bytes
+		MaxSegmentSizeBytes: 100 << 20,          // x-stream-max-segment-size-bytes
+	},
+}
+
+err := conn.Consume(ctx, rabbitmq.ConsumerConfig{
+	Queue:        stream,
+	StreamOffset: rabbitmq.StreamOffsetFirst(),
+	Prefetch:     100,
+}, handle)
+```
+
+| Offset | Starts at |
+|---|---|
+| `StreamOffsetFirst()` | the oldest message still kept |
+| `StreamOffsetLast()` | the last chunk written (the most recent messages) |
+| `StreamOffsetNext()` | only messages published after attaching (the broker default) |
+| `StreamOffsetAt(n)` | offset `n`; every delivery carries its own in the `x-stream-offset` header |
+| `StreamOffsetTime(t)` | the first chunk written at or after `t` (one-second precision) |
+
+RabbitMQ has rules for streams, and the library checks them before touching the broker. A stream must be named and durable, and can't be exclusive or auto-delete; those return `ErrInvalidQueue`. A stream consumer needs manual acks and a prefetch (the default prefetch is 10), so `AutoAck` on a stream, a `StreamOffset` on a queue that isn't a stream, or a negative offset make `Run` return `ErrInvalidConsumer` at once instead of retrying. `MaxAge` must be whole seconds.
+
+After a reconnect a stream consumer resumes just after the last offset its handler saw, instead of replaying from `StreamOffset` again. The handler's error doesn't requeue or dead-letter a stream message: the message stays in the log either way.
 
 ## 📊 OpenTelemetry
 

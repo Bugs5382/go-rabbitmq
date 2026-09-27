@@ -155,3 +155,72 @@ func ExampleWithBackoff() {
 	}
 	defer func() { _ = conn.Close() }()
 }
+
+// ExampleWithMandatory reports a message no queue is bound to receive, instead
+// of treating the broker's ack as success. The caller can then tell its own
+// client the message was not accepted.
+func ExampleWithMandatory() {
+	ctx := context.Background()
+	conn, err := rabbitmq.Connect(ctx, "amqp://guest:guest@localhost:5672/")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	pub := conn.NewPublisher("events",
+		rabbitmq.WithExchangeDeclare(rabbitmq.ExchangeConfig{Name: "events", Kind: "topic"}),
+		rabbitmq.WithMandatory(), // mandatory flag + publisher confirms + return tracking
+		rabbitmq.WithConfirmTimeout(5*time.Second),
+	)
+
+	err = pub.Publish(ctx, "orders.created", []byte(`{"id":42}`), rabbitmq.WithMessageID("order-42"))
+	var unroutable *rabbitmq.UnroutableError
+	switch {
+	case err == nil:
+		// routed to at least one queue and acked by the broker
+	case errors.As(err, &unroutable):
+		// no binding matched: nothing will ever consume this message
+		log.Printf("not accepted: %d %s (key %s)", unroutable.ReplyCode, unroutable.ReplyText, unroutable.RoutingKey)
+	case errors.Is(err, rabbitmq.ErrConfirmTimeout), errors.Is(err, rabbitmq.ErrConfirmLost):
+		// outcome unknown: keep the message and retry; it may be a duplicate
+	default:
+		log.Printf("publish failed: %v", err)
+	}
+}
+
+// ExampleStreamOptions declares a stream with retention limits and reads it
+// from the start. A stream keeps its messages after they are consumed, so any
+// number of consumers can replay it from an offset of their choice.
+func ExampleStreamOptions() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	conn, err := rabbitmq.Connect(ctx, "amqp://guest:guest@localhost:5672/")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	stream := rabbitmq.QueueConfig{
+		Name: "orders.log",
+		Type: rabbitmq.QueueStream,
+		Stream: rabbitmq.StreamOptions{
+			MaxAge:         7 * 24 * time.Hour, // sent as x-max-age "7D"
+			MaxLengthBytes: 10 << 30,           // 10 GiB
+		},
+	}
+	if _, err := conn.DeclareQueue(ctx, stream); err != nil {
+		log.Fatal(err) // errors.Is(err, rabbitmq.ErrInvalidQueue) for a bad stream shape
+	}
+
+	cons := conn.NewConsumer(rabbitmq.ConsumerConfig{
+		Queue:        stream,
+		StreamOffset: rabbitmq.StreamOffsetFirst(), // or Last, Next, At(n), Time(t)
+		Prefetch:     100,                          // streams need manual acks and a prefetch
+	}, func(_ context.Context, d rabbitmq.Delivery) error {
+		log.Printf("offset %v: %s", d.Headers["x-stream-offset"], d.Body)
+		return nil
+	})
+	go func() { _ = cons.Run(ctx) }()
+
+	time.Sleep(time.Second)
+}
