@@ -19,17 +19,22 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 name: GolangCI
+# Build, test and lint run on PRs only: main only moves by squash-merging a PR
+# that already passed here, so a push-to-main re-run spends minutes to learn
+# nothing new. Drafts are skipped; the run happens when the PR is marked ready.
 on:
-  push:
-    paths-ignore:
-      - '**.md'
   pull_request:
     branches:
       - main
+    types: [opened, synchronize, reopened, ready_for_review]
+permissions:
+  contents: read
 jobs:
   build-test:
     name: 🧪 Build & Test
+    if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -51,7 +56,9 @@ jobs:
         run: go test ./... -cover
   lint:
     name: 🧹 GolangCI
+    if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4

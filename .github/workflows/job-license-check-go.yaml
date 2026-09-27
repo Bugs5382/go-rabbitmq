@@ -18,30 +18,41 @@
 # AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
-name: Label Sync
-# Reconciles the repo's labels to the canonical set (.github/labels.yml):
-# creates/updates the canonical labels AND deletes any label not in the file,
-# so every repo carries exactly the standard set (no stale GitHub defaults or
-# leftover release labels).
+name: License Check (Go)
+# Fail if a 3rd-party Go dependency carries a license outside the allowlist. No
+# SAST/vuln scanning here (Go Security covers that).
+#
+# This file ships only to repos with a root go.mod (compose.sh by manifest, the
+# governance overlay by manifest), so it never starts a runner just to find no
+# go.mod. The npm check lives in job-license-check-npm.yaml the same way; both
+# replace the old two-job job-license-check.yaml, whose off-ecosystem job billed
+# a minute per run to do nothing.
+#
+# Pull requests only, and not while the PR is a draft; the PR run covers what
+# merges, so nothing reruns on push to main.
 on:
-  workflow_dispatch:
-  push:
+  pull_request:
     branches: [main]
-    paths: ['.github/labels.yml']
+    types: [opened, synchronize, reopened, ready_for_review]
 permissions:
   contents: read
-  issues: write
 jobs:
-  labeler:
-    name: 🏷️ Sync labels
+  go:
+    name: ⚖️ Dependency licenses (Go)
+    if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Reconcile labels with labels.yml
-        uses: crazy-max/ghaction-github-labeler@v5
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
         with:
-          yaml-file: .github/labels.yml
-          skip-delete: false
-          dry-run: false
+          go-version: 'stable'
+
+      - name: Check dependency licenses
+        run: |
+          go install github.com/google/go-licenses@latest
+          "$(go env GOPATH)/bin/go-licenses" check ./... \
+            --allowed_licenses=MIT,ISC,Apache-2.0,BSD-2-Clause,BSD-3-Clause,0BSD,CC0-1.0,Unlicense,MPL-2.0,CC-BY-4.0
