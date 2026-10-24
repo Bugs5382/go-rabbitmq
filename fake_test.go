@@ -41,6 +41,10 @@ type fakeBroker struct {
 	dialErrs  []error
 	dialCount int
 	conns     []*fakeConn
+
+	// serverProps are the server properties handed to each successful dial in
+	// order; once spent, a dial gets a default RabbitMQ table.
+	serverProps []amqp.Table
 }
 
 // dial implements dialFunc.
@@ -58,6 +62,11 @@ func (b *fakeBroker) dial(_ string, _ amqp.Config) (wireConn, error) {
 		return nil, b.dialErr
 	}
 	c := newFakeConn()
+	c.props = amqp.Table{"product": "RabbitMQ", "version": "4.0.0"}
+	if len(b.serverProps) > 0 {
+		c.props = b.serverProps[0]
+		b.serverProps = b.serverProps[1:]
+	}
 	b.conns = append(b.conns, c)
 	return c, nil
 }
@@ -85,6 +94,7 @@ type fakeConn struct {
 	channels     []*fakeChannel
 	channelErr   error
 	chanTemplate func(idx int, ch *fakeChannel) // configures each channel by open order
+	props        amqp.Table                     // server properties sent on connect
 }
 
 func newFakeConn() *fakeConn { return &fakeConn{} }
@@ -142,6 +152,8 @@ func (c *fakeConn) NotifyClose(receiver chan *amqp.Error) chan *amqp.Error {
 	c.closeNotify = append(c.closeNotify, receiver)
 	return receiver
 }
+
+func (c *fakeConn) serverProperties() amqp.Table { return c.props }
 
 func (c *fakeConn) IsClosed() bool {
 	c.mu.Lock()

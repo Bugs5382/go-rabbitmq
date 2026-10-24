@@ -5,6 +5,7 @@
 ## ✨ Highlights
 
 - 🔌 **Self-healing connection** — one `Conn` re-dials with bounded backoff; publishers and consumers ride through drops.
+- 🩺 **Broker version for health bodies** — `ServerVersion()` reports the connected RabbitMQ version, safe to call while reconnecting.
 - ✅ **Publisher confirms** — `WithConfirms()` returns nil only once the broker has the message.
 - 📭 **Unroutable messages surface** — `WithMandatory()` turns a message no queue receives into `ErrUnroutable` instead of a silent ack.
 - 🎯 **Settlement from your handler** — return nil, `ErrRequeue` or `ErrDeadLetter`; no manual acks.
@@ -30,6 +31,19 @@ if err != nil {
 	log.Fatal(err)
 }
 defer conn.Close()
+```
+
+### Health
+
+`Healthy()` says whether a live connection is up right now, and `ServerVersion()` returns the broker version from the server properties RabbitMQ sends on connect (for example `4.1.4`, or `""` if the broker sent none). Neither blocks. While the connection is down or reconnecting, `ServerVersion()` keeps the last broker it connected to until a reconnect replaces it, so a health body can always show the version next to the state. `ServerProperties()` returns a copy of the whole table (product, platform, cluster name, capabilities).
+
+```go
+health := map[string]any{
+	"rabbitmq": map[string]any{
+		"healthy": conn.Healthy(),
+		"version": conn.ServerVersion(),
+	},
+}
 ```
 
 ## 📤 Publish

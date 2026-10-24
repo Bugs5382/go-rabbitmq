@@ -41,6 +41,9 @@ type wireConn interface {
 	NotifyClose(receiver chan *amqp.Error) chan *amqp.Error
 	IsClosed() bool
 	Close() error
+	// serverProperties returns the server properties the broker sent in
+	// connection.start (product, version, capabilities and so on).
+	serverProperties() amqp.Table
 }
 
 // wireChannel is the subset of *amqp.Channel the library uses. Every method but
@@ -112,6 +115,9 @@ func (c realConn) Channel() (wireChannel, error) {
 	}
 	return realChannel{ch}, nil
 }
+
+// serverProperties returns the properties amqp091 recorded on connect.
+func (c realConn) serverProperties() amqp.Table { return c.Properties }
 
 // defaultDial is the production dialFunc.
 func defaultDial(url string, cfg amqp.Config) (wireConn, error) {

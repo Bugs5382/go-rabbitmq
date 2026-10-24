@@ -16,7 +16,8 @@
 // # Pieces
 //
 //   - Conn is the connection manager. Connect returns one; it re-dials in the
-//     background and exposes health via IsClosed, Healthy and Reconnects.
+//     background and exposes health via Healthy and Reconnects, and the
+//     connected broker's version via ServerVersion and ServerProperties.
 //   - Publisher is created from a Conn and an exchange. Publish ensures a live
 //     channel and retries within bounded backoff before returning an error, so an
 //     outbox worker can simply try again later. WithConfirms makes Publish wait

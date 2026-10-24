@@ -56,6 +56,12 @@ type Conn struct {
 	closed     bool
 	reconnects atomic.Uint64
 
+	// serverProps is a private copy of the server properties of the most
+	// recent successful connection. It is kept while disconnected, so
+	// ServerVersion reports the last broker seen until a reconnect replaces it
+	// (issue #24).
+	serverProps amqp.Table
+
 	// abandoned is closed, and abandonErr set, once the background reconnect
 	// gives up (Backoff.MaxRetries spent), so waiters fail instead of blocking
 	// forever (issue #20).
@@ -183,10 +189,13 @@ func (c *Conn) abandonedErr() error {
 	return fmt.Errorf("%w: %w: %v", ErrNotReady, ErrReconnectAbandoned, c.abandonErr)
 }
 
-// setConn installs a live connection and signals readiness.
+// setConn installs a live connection, records its server properties and
+// signals readiness.
 func (c *Conn) setConn(conn wireConn) {
+	props := copyTable(conn.serverProperties())
 	c.mu.Lock()
 	c.conn = conn
+	c.serverProps = props
 	select {
 	case <-c.ready:
 		// already closed (already signalled ready); nothing to do.
@@ -194,6 +203,7 @@ func (c *Conn) setConn(conn wireConn) {
 		close(c.ready)
 	}
 	c.mu.Unlock()
+	c.log.Debugf("rabbitmq: broker %v version %q", props["product"], tableString(props, "version"))
 }
 
 // clearConn marks the manager as having no live connection and resets readiness.
@@ -263,6 +273,29 @@ func (c *Conn) Healthy() bool {
 	}
 	conn, _ := c.current()
 	return conn != nil && !conn.IsClosed()
+}
+
+// ServerVersion returns the broker version reported by the most recent
+// successful connection (the "version" server property, for example "4.1.4"),
+// or "" when the broker sent none. It never blocks and is safe while the
+// connection is down or reconnecting: it keeps reporting the last broker it
+// connected to until a reconnect replaces it. Pair it with Healthy for a
+// health body that lists the dependency's state and version.
+func (c *Conn) ServerVersion() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return tableString(c.serverProps, "version")
+}
+
+// ServerProperties returns a copy of the server properties reported by the
+// most recent successful connection: product, version, platform, cluster_name,
+// capabilities and so on. Like ServerVersion it never blocks and keeps the last
+// known values while reconnecting. Changing the returned table does not affect
+// the Conn.
+func (c *Conn) ServerProperties() amqp.Table {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return copyTable(c.serverProps)
 }
 
 // Reconnects returns the number of successful reconnections since Connect.

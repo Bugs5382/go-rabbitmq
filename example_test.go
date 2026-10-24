@@ -26,6 +26,7 @@ OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"time"
@@ -52,6 +53,25 @@ func ExampleConnect() {
 		// try again later (for example from an outbox).
 		log.Printf("publish failed, will retry: %v", err)
 	}
+}
+
+// ExampleConn_ServerVersion reports the broker's state and version in a health
+// body. Both calls are safe while the connection is reconnecting.
+func ExampleConn_ServerVersion() {
+	conn, err := rabbitmq.Connect(context.Background(), "amqp://guest:guest@localhost:5672/")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	http.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
+		state := "up"
+		if !conn.Healthy() {
+			state = "down"
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+		_, _ = fmt.Fprintf(w, "rabbitmq: %s (version %s)\n", state, conn.ServerVersion())
+	})
 }
 
 // ExampleConn_Consume shows a resilient consumer that re-declares its topology
