@@ -32,6 +32,7 @@ import (
 	"time"
 
 	rabbitmq "github.com/Bugs5382/go-rabbitmq"
+	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 // ExampleConnect shows the minimal path: connect (with auto-reconnect on by
@@ -152,6 +153,36 @@ func ExampleConn_DeclareTopology() {
 		Exchanges: []rabbitmq.ExchangeConfig{{Name: "events", Kind: "topic"}},
 		Queues:    []rabbitmq.QueueConfig{{Name: "orders", Type: rabbitmq.QueueQuorum}},
 		Bindings:  []rabbitmq.BindingConfig{{Queue: "orders", Exchange: "events", RoutingKey: "orders.*"}},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+// ExampleConn_KeepTopology keeps a dead-letter exchange and queue in place for
+// a service that never consumes them. The work queue dead-letters into the
+// exchange; the topology is declared now and again after every reconnect.
+func ExampleConn_KeepTopology() {
+	ctx := context.Background()
+	conn, err := rabbitmq.Connect(ctx, "amqp://guest:guest@localhost:5672/")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	err = conn.KeepTopology(ctx, rabbitmq.Topology{
+		Exchanges: []rabbitmq.ExchangeConfig{
+			{Name: "orders", Kind: "direct"},
+			{Name: "orders.dlx", Kind: "fanout"},
+		},
+		Queues: []rabbitmq.QueueConfig{
+			{Name: "orders.dlq", Type: rabbitmq.QueueQuorum},
+			{Name: "orders.work", Type: rabbitmq.QueueQuorum, Args: amqp.Table{"x-dead-letter-exchange": "orders.dlx"}},
+		},
+		Bindings: []rabbitmq.BindingConfig{
+			{Queue: "orders.dlq", Exchange: "orders.dlx"},
+			{Queue: "orders.work", Exchange: "orders", RoutingKey: "work"},
+		},
 	})
 	if err != nil {
 		log.Fatal(err)

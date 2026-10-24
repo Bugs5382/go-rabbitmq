@@ -318,7 +318,16 @@ err := conn.DeclareTopology(ctx, rabbitmq.Topology{
 _ = conn.DeclareExchange(ctx, rabbitmq.ExchangeConfig{Name: "events"})
 q, _ := conn.DeclareQueue(ctx, rabbitmq.QueueConfig{Name: "orders"}) // q.Name is authoritative for server-named
 _ = conn.BindQueue(ctx, rabbitmq.BindingConfig{Queue: q.Name, Exchange: "events", RoutingKey: "orders.*"})
+
+// declare now AND again after every reconnect, without consuming (dead-letter queues)
+err = conn.KeepTopology(ctx, rabbitmq.Topology{
+	Exchanges: []rabbitmq.ExchangeConfig{{Name: "orders.dlx", Kind: "fanout"}},
+	Queues:    []rabbitmq.QueueConfig{{Name: "orders.dlq", Type: rabbitmq.QueueQuorum}},
+	Bindings:  []rabbitmq.BindingConfig{{Queue: "orders.dlq", Exchange: "orders.dlx"}},
+})
 ```
+
+`DeclareTopology` runs once. Only consumers re-declare their topology on reconnect, so a queue nobody consumes (a dead-letter queue) stays missing if the broker loses it. Use `KeepTopology` for that: it validates the queues (`ErrInvalidQueue`), declares now and returns the error (nothing is kept on error), then re-declares on every new connection before publishers and consumers get it. A failed re-declare is logged, never blocks the reconnect, and is retried on the next one. Do not use `Observer.OnConnect` for this; it fires after the connection is handed out.
 
 ---
 

@@ -353,3 +353,95 @@ func declareTopologyOn(ch wireChannel, log Logger, t Topology) error {
 	}
 	return nil
 }
+
+// KeepTopology declares t now, like DeclareTopology, and keeps it on the Conn
+// so it is declared again after every reconnect. Use it for topology a service
+// owns but does not consume, such as a dead-letter exchange and queue: a
+// consumer re-declares its own queue on reconnect, but a queue that is only
+// declared would otherwise stay missing after the broker loses it (a node
+// rebuilt from scratch, a transient or exclusive queue, a manual delete).
+//
+// The queues are validated before anything reaches the broker; an invalid
+// queue returns ErrInvalidQueue. If the first declare fails, the error is
+// returned and t is not kept, so the caller can retry the call.
+//
+// On a reconnect the kept topologies are declared on the new connection before
+// it is handed to publishers and consumers, so a publish cannot race the
+// re-declare. A failed re-declare is logged and does not hold up the
+// reconnect; the next reconnect tries again. Nothing is consumed.
+//
+// KeepTopology keeps its own copy of the slices in t; the Args tables are
+// shared, so do not change them after the call. There is no way to forget a
+// kept topology other than closing the Conn.
+func (c *Conn) KeepTopology(ctx context.Context, t Topology) error {
+	for _, q := range t.Queues {
+		if err := q.normalize().validate(); err != nil {
+			c.log.Warnf("rabbitmq: kept topology rejected before declare: %v", err)
+			return err
+		}
+	}
+	kept := &Topology{
+		Exchanges: append([]ExchangeConfig(nil), t.Exchanges...),
+		Queues:    append([]QueueConfig(nil), t.Queues...),
+		Bindings:  append([]BindingConfig(nil), t.Bindings...),
+	}
+	// Register before declaring, so a reconnect that lands between the two
+	// still re-declares it; undo the registration if the declare fails.
+	c.keptMu.Lock()
+	c.kept = append(c.kept, kept)
+	c.keptMu.Unlock()
+
+	if err := c.DeclareTopology(ctx, *kept); err != nil {
+		c.forgetKept(kept)
+		c.log.Warnf("rabbitmq: kept topology not declared, not keeping it: %v", err)
+		return err
+	}
+	c.log.Infof("rabbitmq: keeping topology (%d exchanges, %d queues, %d bindings) across reconnects",
+		len(kept.Exchanges), len(kept.Queues), len(kept.Bindings))
+	return nil
+}
+
+// forgetKept removes one registration added by KeepTopology.
+func (c *Conn) forgetKept(t *Topology) {
+	c.keptMu.Lock()
+	defer c.keptMu.Unlock()
+	for i, k := range c.kept {
+		if k == t {
+			c.kept = append(c.kept[:i], c.kept[i+1:]...)
+			return
+		}
+	}
+}
+
+// redeclareKept declares every kept topology on a freshly dialled connection,
+// before setConn hands it out. Each topology gets its own channel, because a
+// failed declare closes the channel it ran on. Failures are logged and
+// skipped: the reconnect itself must not depend on them.
+func (c *Conn) redeclareKept(conn wireConn) {
+	c.keptMu.Lock()
+	kept := append([]*Topology(nil), c.kept...)
+	c.keptMu.Unlock()
+	if len(kept) == 0 {
+		return
+	}
+	c.log.Debugf("rabbitmq: declaring %d kept topologies on the new connection", len(kept))
+	failed := 0
+	for i, t := range kept {
+		ch, err := conn.Channel()
+		if err != nil {
+			failed++
+			c.log.Warnf("rabbitmq: kept topology %d: open channel: %v", i+1, err)
+			continue
+		}
+		if err := declareTopologyOn(ch, c.log, *t); err != nil {
+			failed++
+			c.log.Warnf("rabbitmq: kept topology %d not declared after reconnect; next reconnect retries: %v", i+1, err)
+		}
+		_ = ch.Close()
+	}
+	if failed > 0 {
+		c.log.Errorf("rabbitmq: %d of %d kept topologies not declared after reconnect", failed, len(kept))
+		return
+	}
+	c.log.Infof("rabbitmq: declared %d kept topologies after reconnect", len(kept))
+}

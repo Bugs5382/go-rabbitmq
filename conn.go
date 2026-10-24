@@ -67,6 +67,11 @@ type Conn struct {
 	// forever (issue #20).
 	abandoned  chan struct{}
 	abandonErr error
+
+	// kept holds the topologies registered with KeepTopology. Each is declared
+	// again on every new connection before it is handed out (issue #25).
+	keptMu sync.Mutex
+	kept   []*Topology
 }
 
 // Connect establishes the initial connection and starts the background monitor.
@@ -165,6 +170,7 @@ func (c *Conn) monitor(conn wireConn) {
 			c.abandon(err)
 			return
 		}
+		c.redeclareKept(next)
 		c.reconnects.Add(1)
 		c.setConn(next)
 		c.opts.observer.OnConnect()
