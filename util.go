@@ -23,7 +23,11 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 */
 
-import "net/url"
+import (
+	"net/url"
+
+	amqp "github.com/rabbitmq/amqp091-go"
+)
 
 // safeURL returns the AMQP URL with any password redacted, so credentials never
 // reach a log line. A URL that cannot be parsed is reported as "<redacted>".
@@ -33,4 +37,34 @@ func safeURL(raw string) string {
 		return "<redacted>"
 	}
 	return u.Redacted()
+}
+
+// copyTable returns a deep copy of t, so nested tables (such as the broker's
+// capabilities) are not shared with the caller. A nil table stays nil.
+func copyTable(t amqp.Table) amqp.Table {
+	if t == nil {
+		return nil
+	}
+	out := make(amqp.Table, len(t))
+	for k, v := range t {
+		if nested, ok := v.(amqp.Table); ok {
+			v = copyTable(nested)
+		}
+		out[k] = v
+	}
+	return out
+}
+
+// tableString returns the string value of key in t, or "" when it is missing
+// or not a string. amqp091 decodes long strings as string and byte arrays as
+// []byte; both are accepted.
+func tableString(t amqp.Table, key string) string {
+	switch v := t[key].(type) {
+	case string:
+		return v
+	case []byte:
+		return string(v)
+	default:
+		return ""
+	}
 }

@@ -14,7 +14,7 @@ go get github.com/Bugs5382/go-rabbitmq
 
 | Import path | What you use it for | Key exports |
 |---|---|---|
-| `github.com/Bugs5382/go-rabbitmq` | Everything: connect, publish, consume, declare topology. | `Connect`, `Conn`, `Option` (`WithBackoff`, `WithTLS`, `WithLogger`, `WithObserver`, `WithHeartbeat`, `WithVhost`, `WithClientProperties`, `WithPublishInterceptor`, `WithConsumeInterceptor`), `Backoff`, `DefaultBackoff`, `Publisher`, `PublishOption`, `PublisherOption` (`WithConfirms`, `WithConfirmTimeout`, `WithMandatory`, ...), `UnroutableError`, `PublishIDHeader`, `Delivery`, `Handler`, `ConsumerConfig`, `Consumer` (`NewConsumer`, `Run`, `Ready`, `Status`), `ConsumerStatus`, `ConsumerState`, `ErrRequeue`/`ErrDeadLetter`, `ExchangeConfig`, `QueueConfig`, `BindingConfig`, `Topology`, `QueueType` (`QueueClassic`/`QueueQuorum`/`QueueStream`), `StreamOptions`, `StreamOffset` (`StreamOffsetFirst`/`Last`/`Next`/`At`/`Time`), `Logger`, `Observer`/`NopObserver`, `PublishInterceptor`/`ConsumeInterceptor`, sentinel errors. |
+| `github.com/Bugs5382/go-rabbitmq` | Everything: connect, publish, consume, declare topology. | `Connect`, `Conn` (`Healthy`, `Reconnects`, `ServerVersion`, `ServerProperties`), `Option` (`WithBackoff`, `WithTLS`, `WithLogger`, `WithObserver`, `WithHeartbeat`, `WithVhost`, `WithClientProperties`, `WithPublishInterceptor`, `WithConsumeInterceptor`), `Backoff`, `DefaultBackoff`, `Publisher`, `PublishOption`, `PublisherOption` (`WithConfirms`, `WithConfirmTimeout`, `WithMandatory`, ...), `UnroutableError`, `PublishIDHeader`, `Delivery`, `Handler`, `ConsumerConfig`, `Consumer` (`NewConsumer`, `Run`, `Ready`, `Status`), `ConsumerStatus`, `ConsumerState`, `ErrRequeue`/`ErrDeadLetter`, `ExchangeConfig`, `QueueConfig`, `BindingConfig`, `Topology`, `QueueType` (`QueueClassic`/`QueueQuorum`/`QueueStream`), `StreamOptions`, `StreamOffset` (`StreamOffsetFirst`/`Last`/`Next`/`At`/`Time`), `Logger`, `Observer`/`NopObserver`, `PublishInterceptor`/`ConsumeInterceptor`, sentinel errors. |
 | `github.com/Bugs5382/go-rabbitmq/otel` | OpenTelemetry tracing + metrics. | `Instrument(...) []rabbitmq.Option`, `PublishInterceptor`, `ConsumeInterceptor`, `WithTracerProvider`, `WithMeterProvider`, `WithPropagator`. |
 
 ---
@@ -55,9 +55,13 @@ conn, err := rabbitmq.Connect(ctx, "amqp://guest:guest@localhost:5672/",
 if err != nil { /* bad URL or broker unreachable within ctx/MaxRetries */ }
 defer conn.Close()
 
-_ = conn.Healthy()    // live connection available right now?
-_ = conn.Reconnects() // successful reconnects since Connect
+_ = conn.Healthy()          // live connection available right now?
+_ = conn.Reconnects()       // successful reconnects since Connect
+_ = conn.ServerVersion()    // broker version, e.g. "4.1.4"; "" if the broker sent none
+_ = conn.ServerProperties() // copy of the broker's server properties
 ```
+
+`ServerVersion` and `ServerProperties` never block. They report the most recent successful connection and keep those values while the connection is down or reconnecting, so a health body can list the broker's state (`Healthy`) and version together at any time.
 
 TLS/mTLS: pass `rabbitmq.WithTLS(&tls.Config{...})` and an `amqps://` URL.
 
