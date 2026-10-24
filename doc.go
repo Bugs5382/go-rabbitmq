@@ -31,7 +31,9 @@
 //     actually consuming, for readiness probes.
 //   - The topology helpers (DeclareExchange, DeclareQueue, BindQueue,
 //     DeclareTopology) declare exchanges, queues and bindings idempotently and
-//     guard the classic, quorum and stream queue rules. A QueueStream queue is
+//     guard the classic, quorum and stream queue rules. KeepTopology does the
+//     same and declares the topology again after every reconnect, for queues
+//     nobody consumes, such as a dead-letter queue. A QueueStream queue is
 //     an append-only log with typed retention (StreamOptions); its consumers
 //     pick where they start with ConsumerConfig.StreamOffset.
 //

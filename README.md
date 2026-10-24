@@ -11,6 +11,7 @@
 - 🌊 **Stream queues** — `QueueStream` with typed retention and a typed start offset (first, last, next, a timestamp or an offset).
 - 🚦 **Consumer readiness** — `Consumer.Ready()` for probes, because a healthy connection is not a working consumer.
 - 🛡️ **Queue shape guards** — quorum and stream rules are checked before the declare, with clear errors.
+- 🧱 **Kept topology** — `KeepTopology` declares queues you never consume (a dead-letter queue, say) and declares them again after every reconnect.
 
 ## 📦 Install
 
@@ -158,6 +159,23 @@ rabbitmq.QueueConfig{Name: "jobs.scratch", AutoDelete: true}
 ```
 
 The library still sends a transient non-exclusive queue as asked, since RabbitMQ 3 accepts it. When a broker refuses it, the declare returns `ErrInvalidQueue` (wrapping the broker's error) with the fix in the message.
+
+## 🧱 Topology
+
+`DeclareTopology` declares exchanges, queues and bindings once, idempotently. A consumer re-declares its own queue after every reconnect, but a queue a service only declares does not come back by itself if the broker loses it (a node rebuilt from scratch, a transient or exclusive queue, a manual delete). For topology you own but never consume, such as a dead-letter exchange and queue, use `KeepTopology`:
+
+```go
+err := conn.KeepTopology(ctx, rabbitmq.Topology{
+	Exchanges: []rabbitmq.ExchangeConfig{{Name: "orders.dlx", Kind: "fanout"}},
+	Queues: []rabbitmq.QueueConfig{
+		{Name: "orders.dlq", Type: rabbitmq.QueueQuorum},
+		{Name: "orders.work", Type: rabbitmq.QueueQuorum, Args: amqp.Table{"x-dead-letter-exchange": "orders.dlx"}},
+	},
+	Bindings: []rabbitmq.BindingConfig{{Queue: "orders.dlq", Exchange: "orders.dlx"}},
+})
+```
+
+It declares the topology now and returns the error, with the same queue shape guards as every other declare. Once that succeeds the `Conn` keeps it and declares it again on every new connection, before publishers and consumers get that connection, so a publish never races the re-declare. A failed re-declare is logged and does not hold up the reconnect; the next reconnect tries again. Nothing is consumed.
 
 ## 🌊 Streams
 
